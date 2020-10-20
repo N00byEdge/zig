@@ -2023,7 +2023,7 @@ pub fn hasCppExt(filename: []const u8) bool {
 }
 
 pub fn hasAsmExt(filename: []const u8) bool {
-    return mem.endsWith(u8, filename, ".s") or mem.endsWith(u8, filename, ".S");
+    return mem.endsWith(u8, filename, ".s") or mem.endsWith(u8, filename, ".S") or mem.endsWith(u8, filename, ".asm");
 }
 
 pub fn hasSharedLibraryExt(filename: []const u8) bool {
