@@ -591,7 +591,7 @@ pub fn default_panic(msg: []const u8, error_return_trace: ?*StackTrace) noreturn
     @setCold(true);
     if (@hasDecl(root, "os") and @hasDecl(root.os, "panic")) {
         root.os.panic(msg, error_return_trace);
-        unreachable;
+        //unreachable;
     }
     switch (os.tag) {
         .freestanding => {
