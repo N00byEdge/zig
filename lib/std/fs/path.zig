@@ -28,6 +28,7 @@ pub const delimiter_windows = ';';
 pub const delimiter_posix = ':';
 pub const delimiter = if (builtin.os.tag == .windows) delimiter_windows else delimiter_posix;
 
+/// Returns if the given byte is a valid path separator
 pub fn isSep(byte: u8) bool {
     if (builtin.os.tag == .windows) {
         return byte == '/' or byte == '\\';
@@ -749,8 +750,12 @@ fn testResolvePosix(paths: []const []const u8, expected: []const u8) !void {
     return testing.expect(mem.eql(u8, actual, expected));
 }
 
+/// Strip the last component from a file path.
+///
 /// If the path is a file in the current directory (no directory component)
-/// then returns null
+/// then returns null.
+///
+/// If the path is the root directory, returns null.
 pub fn dirname(path: []const u8) ?[]const u8 {
     if (builtin.os.tag == .windows) {
         return dirnameWindows(path);
@@ -765,19 +770,19 @@ pub fn dirnameWindows(path: []const u8) ?[]const u8 {
 
     const root_slice = diskDesignatorWindows(path);
     if (path.len == root_slice.len)
-        return path;
+        return null;
 
     const have_root_slash = path.len > root_slice.len and (path[root_slice.len] == '/' or path[root_slice.len] == '\\');
 
     var end_index: usize = path.len - 1;
 
-    while ((path[end_index] == '/' or path[end_index] == '\\') and end_index > root_slice.len) {
+    while (path[end_index] == '/' or path[end_index] == '\\') {
         if (end_index == 0)
             return null;
         end_index -= 1;
     }
 
-    while (path[end_index] != '/' and path[end_index] != '\\' and end_index > root_slice.len) {
+    while (path[end_index] != '/' and path[end_index] != '\\') {
         if (end_index == 0)
             return null;
         end_index -= 1;
@@ -800,7 +805,7 @@ pub fn dirnamePosix(path: []const u8) ?[]const u8 {
     var end_index: usize = path.len - 1;
     while (path[end_index] == '/') {
         if (end_index == 0)
-            return path[0..1];
+            return null;
         end_index -= 1;
     }
 
@@ -810,7 +815,7 @@ pub fn dirnamePosix(path: []const u8) ?[]const u8 {
         end_index -= 1;
     }
 
-    if (end_index == 0 and path[end_index] == '/')
+    if (end_index == 0 and path[0] == '/')
         return path[0..1];
 
     if (end_index == 0)
@@ -823,8 +828,10 @@ test "dirnamePosix" {
     testDirnamePosix("/a/b/c", "/a/b");
     testDirnamePosix("/a/b/c///", "/a/b");
     testDirnamePosix("/a", "/");
-    testDirnamePosix("/", "/");
-    testDirnamePosix("////", "/");
+    testDirnamePosix("/", null);
+    testDirnamePosix("//", null);
+    testDirnamePosix("///", null);
+    testDirnamePosix("////", null);
     testDirnamePosix("", null);
     testDirnamePosix("a", null);
     testDirnamePosix("a/", null);
@@ -832,27 +839,27 @@ test "dirnamePosix" {
 }
 
 test "dirnameWindows" {
-    testDirnameWindows("c:\\", "c:\\");
+    testDirnameWindows("c:\\", null);
     testDirnameWindows("c:\\foo", "c:\\");
     testDirnameWindows("c:\\foo\\", "c:\\");
     testDirnameWindows("c:\\foo\\bar", "c:\\foo");
     testDirnameWindows("c:\\foo\\bar\\", "c:\\foo");
     testDirnameWindows("c:\\foo\\bar\\baz", "c:\\foo\\bar");
-    testDirnameWindows("\\", "\\");
+    testDirnameWindows("\\", null);
     testDirnameWindows("\\foo", "\\");
     testDirnameWindows("\\foo\\", "\\");
     testDirnameWindows("\\foo\\bar", "\\foo");
     testDirnameWindows("\\foo\\bar\\", "\\foo");
     testDirnameWindows("\\foo\\bar\\baz", "\\foo\\bar");
-    testDirnameWindows("c:", "c:");
-    testDirnameWindows("c:foo", "c:");
-    testDirnameWindows("c:foo\\", "c:");
+    testDirnameWindows("c:", null);
+    testDirnameWindows("c:foo", null);
+    testDirnameWindows("c:foo\\", null);
     testDirnameWindows("c:foo\\bar", "c:foo");
     testDirnameWindows("c:foo\\bar\\", "c:foo");
     testDirnameWindows("c:foo\\bar\\baz", "c:foo\\bar");
     testDirnameWindows("file:stream", null);
     testDirnameWindows("dir\\file:stream", "dir");
-    testDirnameWindows("\\\\unc\\share", "\\\\unc\\share");
+    testDirnameWindows("\\\\unc\\share", null);
     testDirnameWindows("\\\\unc\\share\\foo", "\\\\unc\\share\\");
     testDirnameWindows("\\\\unc\\share\\foo\\", "\\\\unc\\share\\");
     testDirnameWindows("\\\\unc\\share\\foo\\bar", "\\\\unc\\share\\foo");
@@ -862,8 +869,8 @@ test "dirnameWindows" {
     testDirnameWindows("/a/b", "/a");
     testDirnameWindows("/a", "/");
     testDirnameWindows("", null);
-    testDirnameWindows("/", "/");
-    testDirnameWindows("////", "/");
+    testDirnameWindows("/", null);
+    testDirnameWindows("////", null);
     testDirnameWindows("foo", null);
 }
 
@@ -1181,4 +1188,69 @@ fn testRelativeWindows(from: []const u8, to: []const u8, expected_output: []cons
     const result = try relativeWindows(testing.allocator, from, to);
     defer testing.allocator.free(result);
     testing.expectEqualSlices(u8, expected_output, result);
+}
+
+/// Returns the extension of the file name (if any).
+/// This function will search for the file extension (separated by a `.`) and will return the text after the `.`.
+/// Files that end with `.` are considered to have no extension, files that start with `.`
+/// Examples:
+/// - `"main.zig"`     ⇒ `".zig"`
+/// - `"src/main.zig"` ⇒ `".zig"`
+/// - `".gitignore"`   ⇒ `""`
+/// - `"keep."`        ⇒ `"."`
+/// - `"src.keep.me"`  ⇒ `".me"`
+/// - `"/src/keep.me"`  ⇒ `".me"`
+/// - `"/src/keep.me/"`  ⇒ `".me"`
+/// The returned slice is guaranteed to have its pointer within the start and end
+/// pointer address range of `path`, even if it is length zero.
+pub fn extension(path: []const u8) []const u8 {
+    const filename = basename(path);
+    const index = mem.lastIndexOf(u8, filename, ".") orelse return path[path.len..];
+    if (index == 0) return path[path.len..];
+    return filename[index..];
+}
+
+fn testExtension(path: []const u8, expected: []const u8) void {
+    std.testing.expectEqualStrings(expected, extension(path));
+}
+
+test "extension" {
+    testExtension("", "");
+    testExtension(".", "");
+    testExtension("a.", ".");
+    testExtension("abc.", ".");
+    testExtension(".a", "");
+    testExtension(".file", "");
+    testExtension(".gitignore", "");
+    testExtension("file.ext", ".ext");
+    testExtension("file.ext.", ".");
+    testExtension("very-long-file.bruh", ".bruh");
+    testExtension("a.b.c", ".c");
+    testExtension("a.b.c/", ".c");
+
+    testExtension("/", "");
+    testExtension("/.", "");
+    testExtension("/a.", ".");
+    testExtension("/abc.", ".");
+    testExtension("/.a", "");
+    testExtension("/.file", "");
+    testExtension("/.gitignore", "");
+    testExtension("/file.ext", ".ext");
+    testExtension("/file.ext.", ".");
+    testExtension("/very-long-file.bruh", ".bruh");
+    testExtension("/a.b.c", ".c");
+    testExtension("/a.b.c/", ".c");
+
+    testExtension("/foo/bar/bam/", "");
+    testExtension("/foo/bar/bam/.", "");
+    testExtension("/foo/bar/bam/a.", ".");
+    testExtension("/foo/bar/bam/abc.", ".");
+    testExtension("/foo/bar/bam/.a", "");
+    testExtension("/foo/bar/bam/.file", "");
+    testExtension("/foo/bar/bam/.gitignore", "");
+    testExtension("/foo/bar/bam/file.ext", ".ext");
+    testExtension("/foo/bar/bam/file.ext.", ".");
+    testExtension("/foo/bar/bam/very-long-file.bruh", ".bruh");
+    testExtension("/foo/bar/bam/a.b.c", ".c");
+    testExtension("/foo/bar/bam/a.b.c/", ".c");
 }

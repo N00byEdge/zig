@@ -8,7 +8,7 @@ const fs = std.fs;
 const elf = std.elf;
 const log = std.log.scoped(.link);
 const DW = std.dwarf;
-const leb128 = std.debug.leb;
+const leb128 = std.leb;
 
 const ir = @import("../ir.zig");
 const Module = @import("../Module.zig");
@@ -1260,6 +1260,13 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     const gc_sections = self.base.options.gc_sections orelse !is_obj;
     const stack_size = self.base.options.stack_size_override orelse 16777216;
     const allow_shlib_undefined = self.base.options.allow_shlib_undefined orelse !self.base.options.is_native_os;
+    const compiler_rt_path: ?[]const u8 = if (self.base.options.include_compiler_rt) blk: {
+        if (is_exe_or_dyn_lib) {
+            break :blk comp.compiler_rt_static_lib.?.full_object_path;
+        } else {
+            break :blk comp.compiler_rt_obj.?.full_object_path;
+        }
+    } else null;
 
     // Here we want to determine whether we can save time by not invoking LLD when the
     // output is unchanged. None of the linker options or the object files that are being
@@ -1289,6 +1296,8 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
             _ = try man.addFile(entry.key.status.success.object_path, null);
         }
         try man.addOptionalFile(module_obj_path);
+        try man.addOptionalFile(compiler_rt_path);
+
         // We can skip hashing libc and libc++ components that we are in charge of building from Zig
         // installation sources because they are always a product of the compiler version + target information.
         man.hash.add(stack_size);
@@ -1313,10 +1322,8 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
                 man.hash.addOptionalBytes(self.base.options.dynamic_linker);
             }
         }
-        if (is_dyn_lib) {
-            man.hash.addOptionalBytes(self.base.options.override_soname);
-            man.hash.addOptional(self.base.options.version);
-        }
+        man.hash.addOptionalBytes(self.base.options.soname);
+        man.hash.addOptional(self.base.options.version);
         man.hash.addStringSet(self.base.options.system_libs);
         man.hash.add(allow_shlib_undefined);
         man.hash.add(self.base.options.bind_global_refs_locally);
@@ -1353,8 +1360,10 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     // Create an LLD command line and invoke it.
     var argv = std.ArrayList([]const u8).init(self.base.allocator);
     defer argv.deinit();
-    // Even though we're calling LLD as a library it thinks the first argument is its own exe name.
-    try argv.append("lld");
+    // We will invoke ourselves as a child process to gain access to LLD.
+    // This is necessary because LLD does not behave properly as a library -
+    // it calls exit() and does not reset all global data between invocations.
+    try argv.appendSlice(&[_][]const u8{ comp.self_exe_path.?, "ld.lld" });
     if (is_obj) {
         try argv.append("-r");
     }
@@ -1422,7 +1431,7 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         try argv.append("-shared");
     }
 
-    if (target_util.requiresPIE(target) and self.base.options.output_mode == .Exe) {
+    if (self.base.options.pie and self.base.options.output_mode == .Exe) {
         try argv.append("-pie");
     }
 
@@ -1441,7 +1450,11 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
                     break :o "crtbegin_static.o";
                 }
             } else if (self.base.options.link_mode == .Static) {
-                break :o "crt1.o";
+                if (self.base.options.pie) {
+                    break :o "rcrt1.o";
+                } else {
+                    break :o "crt1.o";
+                }
             } else {
                 break :o "Scrt1.o";
             }
@@ -1505,13 +1518,10 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     }
 
     if (is_dyn_lib) {
-        const soname = self.base.options.override_soname orelse if (self.base.options.version) |ver|
-            try std.fmt.allocPrint(arena, "lib{}.so.{}", .{ self.base.options.root_name, ver.major })
-        else
-            try std.fmt.allocPrint(arena, "lib{}.so", .{self.base.options.root_name});
-        try argv.append("-soname");
-        try argv.append(soname);
-
+        if (self.base.options.soname) |soname| {
+            try argv.append("-soname");
+            try argv.append(soname);
+        }
         if (self.base.options.version_script) |version_script| {
             try argv.append("-version-script");
             try argv.append(version_script);
@@ -1529,25 +1539,29 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         try argv.append(p);
     }
 
-    // compiler-rt and libc
-    if (is_exe_or_dyn_lib and !self.base.options.is_compiler_rt_or_libc) {
-        if (!self.base.options.link_libc) {
-            try argv.append(comp.libc_static_lib.?.full_object_path);
-        }
-        try argv.append(comp.compiler_rt_static_lib.?.full_object_path);
+    // libc
+    if (is_exe_or_dyn_lib and !self.base.options.is_compiler_rt_or_libc and !self.base.options.link_libc) {
+        try argv.append(comp.libc_static_lib.?.full_object_path);
+    }
+
+    // compiler-rt
+    if (compiler_rt_path) |p| {
+        try argv.append(p);
     }
 
     // Shared libraries.
-    const system_libs = self.base.options.system_libs.items();
-    try argv.ensureCapacity(argv.items.len + system_libs.len);
-    for (system_libs) |entry| {
-        const link_lib = entry.key;
-        // By this time, we depend on these libs being dynamically linked libraries and not static libraries
-        // (the check for that needs to be earlier), but they could be full paths to .so files, in which
-        // case we want to avoid prepending "-l".
-        const ext = Compilation.classifyFileExt(link_lib);
-        const arg = if (ext == .shared_library) link_lib else try std.fmt.allocPrint(arena, "-l{}", .{link_lib});
-        argv.appendAssumeCapacity(arg);
+    if (is_exe_or_dyn_lib) {
+        const system_libs = self.base.options.system_libs.items();
+        try argv.ensureCapacity(argv.items.len + system_libs.len);
+        for (system_libs) |entry| {
+            const link_lib = entry.key;
+            // By this time, we depend on these libs being dynamically linked libraries and not static libraries
+            // (the check for that needs to be earlier), but they could be full paths to .so files, in which
+            // case we want to avoid prepending "-l".
+            const ext = Compilation.classifyFileExt(link_lib);
+            const arg = if (ext == .shared_library) link_lib else try std.fmt.allocPrint(arena, "-l{}", .{link_lib});
+            argv.appendAssumeCapacity(arg);
+        }
     }
 
     if (!is_obj) {
@@ -1584,7 +1598,10 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
                 try argv.append(try comp.get_libc_crt_file(arena, "libc_nonshared.a"));
             } else if (target.isMusl()) {
                 try argv.append(comp.libunwind_static_lib.?.full_object_path);
-                try argv.append(try comp.get_libc_crt_file(arena, "libc.a"));
+                try argv.append(try comp.get_libc_crt_file(arena, switch (self.base.options.link_mode) {
+                    .Static => "libc.a",
+                    .Dynamic => "libc.so",
+                }));
             } else if (self.base.options.link_libcpp) {
                 try argv.append(comp.libunwind_static_lib.?.full_object_path);
             } else {
@@ -1613,76 +1630,81 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     }
 
     if (self.base.options.verbose_link) {
-        Compilation.dump_argv(argv.items);
+        // Skip over our own name so that the LLD linker name is the first argv item.
+        Compilation.dump_argv(argv.items[1..]);
     }
 
-    // Oh, snapplesauce! We need null terminated argv.
-    const new_argv = try arena.allocSentinel(?[*:0]const u8, argv.items.len, null);
-    for (argv.items) |arg, i| {
-        new_argv[i] = try arena.dupeZ(u8, arg);
-    }
+    // Sadly, we must run LLD as a child process because it does not behave
+    // properly as a library.
+    const child = try std.ChildProcess.init(argv.items, arena);
+    defer child.deinit();
 
-    var stderr_context: LLDContext = .{
-        .elf = self,
-        .data = std.ArrayList(u8).init(self.base.allocator),
-    };
-    defer stderr_context.data.deinit();
-    var stdout_context: LLDContext = .{
-        .elf = self,
-        .data = std.ArrayList(u8).init(self.base.allocator),
-    };
-    defer stdout_context.data.deinit();
-    const llvm = @import("../llvm.zig");
-    const ok = llvm.Link(
-        .ELF,
-        new_argv.ptr,
-        new_argv.len,
-        append_diagnostic,
-        @ptrToInt(&stdout_context),
-        @ptrToInt(&stderr_context),
-    );
-    if (stderr_context.oom or stdout_context.oom) return error.OutOfMemory;
-    if (stdout_context.data.items.len != 0) {
-        std.log.warn("unexpected LLD stdout: {}", .{stdout_context.data.items});
-    }
-    if (!ok) {
-        // TODO parse this output and surface with the Compilation API rather than
-        // directly outputting to stderr here.
-        std.debug.print("{}", .{stderr_context.data.items});
-        return error.LLDReportedFailure;
-    }
-    if (stderr_context.data.items.len != 0) {
-        std.log.warn("unexpected LLD stderr: {}", .{stderr_context.data.items});
+    if (comp.clang_passthrough_mode) {
+        child.stdin_behavior = .Inherit;
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+
+        const term = child.spawnAndWait() catch |err| {
+            log.err("unable to spawn {s}: {s}", .{ argv.items[0], @errorName(err) });
+            return error.UnableToSpawnSelf;
+        };
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    // TODO https://github.com/ziglang/zig/issues/6342
+                    std.process.exit(1);
+                }
+            },
+            else => std.process.abort(),
+        }
+    } else {
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
+
+        try child.spawn();
+
+        const stderr = try child.stderr.?.reader().readAllAlloc(arena, 10 * 1024 * 1024);
+
+        const term = child.wait() catch |err| {
+            log.err("unable to spawn {s}: {s}", .{ argv.items[0], @errorName(err) });
+            return error.UnableToSpawnSelf;
+        };
+
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    // TODO parse this output and surface with the Compilation API rather than
+                    // directly outputting to stderr here.
+                    std.debug.print("{s}", .{stderr});
+                    return error.LLDReportedFailure;
+                }
+            },
+            else => {
+                log.err("{s} terminated with stderr:\n{s}", .{ argv.items[0], stderr });
+                return error.LLDCrashed;
+            },
+        }
+
+        if (stderr.len != 0) {
+            log.warn("unexpected LLD stderr:\n{s}", .{stderr});
+        }
     }
 
     if (!self.base.options.disable_lld_caching) {
         // Update the file with the digest. If it fails we can continue; it only
         // means that the next invocation will have an unnecessary cache miss.
         Cache.writeSmallFile(directory.handle, id_symlink_basename, &digest) catch |err| {
-            std.log.warn("failed to save linking hash digest file: {}", .{@errorName(err)});
+            log.warn("failed to save linking hash digest file: {}", .{@errorName(err)});
         };
         // Again failure here only means an unnecessary cache miss.
         man.writeManifest() catch |err| {
-            std.log.warn("failed to write cache manifest when linking: {}", .{@errorName(err)});
+            log.warn("failed to write cache manifest when linking: {}", .{@errorName(err)});
         };
         // We hang on to this lock so that the output file path can be used without
         // other processes clobbering it.
         self.base.lock = man.toOwnedLock();
     }
-}
-
-const LLDContext = struct {
-    data: std.ArrayList(u8),
-    elf: *Elf,
-    oom: bool = false,
-};
-
-fn append_diagnostic(context: usize, ptr: [*]const u8, len: usize) callconv(.C) void {
-    const lld_context = @intToPtr(*LLDContext, context);
-    const msg = ptr[0..len];
-    lld_context.data.appendSlice(msg) catch |err| switch (err) {
-        error.OutOfMemory => lld_context.oom = true,
-    };
 }
 
 fn writeDwarfAddrAssumeCapacity(self: *Elf, buf: *std.ArrayList(u8), addr: u64) void {
@@ -2443,7 +2465,10 @@ fn addDbgInfoType(self: *Elf, ty: Type, dbg_info_buffer: *std.ArrayList(u8)) !vo
             try dbg_info_buffer.ensureCapacity(dbg_info_buffer.items.len + 12);
             dbg_info_buffer.appendAssumeCapacity(abbrev_base_type);
             // DW.AT_encoding, DW.FORM_data1
-            dbg_info_buffer.appendAssumeCapacity(if (info.signed) DW.ATE_signed else DW.ATE_unsigned);
+            dbg_info_buffer.appendAssumeCapacity(switch (info.signedness) {
+                .signed => DW.ATE_signed,
+                .unsigned => DW.ATE_unsigned,
+            });
             // DW.AT_byte_size,  DW.FORM_data1
             dbg_info_buffer.appendAssumeCapacity(@intCast(u8, ty.abiSize(self.base.options.target)));
             // DW.AT_name,  DW.FORM_string
@@ -2706,7 +2731,7 @@ fn writeOffsetTableEntry(self: *Elf, index: usize) !void {
     if (self.offset_table_count_dirty) {
         // TODO Also detect virtual address collisions.
         const allocated_size = self.allocatedSize(shdr.sh_offset);
-        const needed_size = self.local_symbols.items.len * entry_size;
+        const needed_size = self.offset_table.items.len * entry_size;
         if (needed_size > allocated_size) {
             // Must move the entire got section.
             const new_offset = self.findFreeSpace(needed_size, entry_size);

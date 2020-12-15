@@ -19,8 +19,6 @@ pub const Error = error{OutOfMemory};
 const TypeError = Error || error{UnsupportedType};
 const TransError = TypeError || error{UnsupportedTranslation};
 
-const DeclTable = std.AutoArrayHashMap(usize, []const u8);
-
 const SymbolTable = std.StringArrayHashMap(*ast.Node);
 const AliasList = std.ArrayList(struct {
     alias: []const u8,
@@ -254,24 +252,25 @@ const Scope = struct {
 pub const Context = struct {
     gpa: *mem.Allocator,
     arena: *mem.Allocator,
-    token_ids: std.ArrayListUnmanaged(Token.Id),
-    token_locs: std.ArrayListUnmanaged(Token.Loc),
-    errors: std.ArrayListUnmanaged(ast.Error),
+    token_ids: std.ArrayListUnmanaged(Token.Id) = .{},
+    token_locs: std.ArrayListUnmanaged(Token.Loc) = .{},
+    errors: std.ArrayListUnmanaged(ast.Error) = .{},
     source_buffer: *std.ArrayList(u8),
     err: Error,
     source_manager: *clang.SourceManager,
-    decl_table: DeclTable,
+    decl_table: std.AutoArrayHashMapUnmanaged(usize, []const u8) = .{},
     alias_list: AliasList,
     global_scope: *Scope.Root,
     clang_context: *clang.ASTContext,
     mangle_count: u32 = 0,
-    root_decls: std.ArrayListUnmanaged(*ast.Node),
+    root_decls: std.ArrayListUnmanaged(*ast.Node) = .{},
+    opaque_demotes: std.AutoHashMapUnmanaged(usize, void) = .{},
 
     /// This one is different than the root scope's name table. This contains
     /// a list of names that we found by visiting all the top level decls without
     /// translating them. The other maps are updated as we translate; this one is updated
     /// up front in a pre-processing step.
-    global_names: std.StringArrayHashMap(void),
+    global_names: std.StringArrayHashMapUnmanaged(void) = .{},
 
     fn getMangle(c: *Context) u32 {
         c.mangle_count += 1;
@@ -362,24 +361,21 @@ pub fn translate(
         .source_buffer = &source_buffer,
         .source_manager = ast_unit.getSourceManager(),
         .err = undefined,
-        .decl_table = DeclTable.init(gpa),
         .alias_list = AliasList.init(gpa),
         .global_scope = try arena.allocator.create(Scope.Root),
         .clang_context = ast_unit.getASTContext(),
-        .global_names = std.StringArrayHashMap(void).init(gpa),
-        .token_ids = .{},
-        .token_locs = .{},
-        .errors = .{},
-        .root_decls = .{},
     };
     context.global_scope.* = Scope.Root.init(&context);
-    defer context.decl_table.deinit();
-    defer context.alias_list.deinit();
-    defer context.token_ids.deinit(gpa);
-    defer context.token_locs.deinit(gpa);
-    defer context.errors.deinit(gpa);
-    defer context.global_names.deinit();
-    defer context.root_decls.deinit(gpa);
+    defer {
+        context.decl_table.deinit(gpa);
+        context.alias_list.deinit();
+        context.token_ids.deinit(gpa);
+        context.token_locs.deinit(gpa);
+        context.errors.deinit(gpa);
+        context.global_names.deinit(gpa);
+        context.root_decls.deinit(gpa);
+        context.opaque_demotes.deinit(gpa);
+    }
 
     try prepopulateGlobalNameTable(ast_unit, &context);
 
@@ -437,7 +433,7 @@ fn prepopulateGlobalNameTable(ast_unit: *clang.ASTUnit, c: *Context) !void {
                 const macro = @ptrCast(*clang.MacroDefinitionRecord, entity);
                 const raw_name = macro.getName_getNameStart();
                 const name = try c.str(raw_name);
-                _ = try c.global_names.put(name, {});
+                _ = try c.global_names.put(c.gpa, name, {});
             },
             else => {},
         }
@@ -465,7 +461,7 @@ fn declVisitorC(context: ?*c_void, decl: *const clang.Decl) callconv(.C) bool {
 fn declVisitorNamesOnly(c: *Context, decl: *const clang.Decl) Error!void {
     if (decl.castToNamedDecl()) |named_decl| {
         const decl_name = try c.str(named_decl.getName_bytes_begin());
-        _ = try c.global_names.put(decl_name, {});
+        _ = try c.global_names.put(c.gpa, decl_name, {});
     }
 }
 
@@ -804,7 +800,7 @@ fn visitVarDecl(c: *Context, var_decl: *const clang.VarDecl, mangled_name: ?[]co
 }
 
 fn transTypeDefAsBuiltin(c: *Context, typedef_decl: *const clang.TypedefNameDecl, builtin_name: []const u8) !*ast.Node {
-    _ = try c.decl_table.put(@ptrToInt(typedef_decl.getCanonicalDecl()), builtin_name);
+    _ = try c.decl_table.put(c.gpa, @ptrToInt(typedef_decl.getCanonicalDecl()), builtin_name);
     return transCreateNodeIdentifier(c, builtin_name);
 }
 
@@ -851,7 +847,7 @@ fn transTypeDef(c: *Context, typedef_decl: *const clang.TypedefNameDecl, top_lev
         return transCreateNodeIdentifier(c, checked_name);
     }
 
-    _ = try c.decl_table.put(@ptrToInt(typedef_decl.getCanonicalDecl()), checked_name);
+    _ = try c.decl_table.put(c.gpa, @ptrToInt(typedef_decl.getCanonicalDecl()), checked_name);
     const node = (try transCreateNodeTypedef(rp, typedef_decl, true, checked_name)) orelse return null;
     try addTopLevelDecl(c, checked_name, node);
     return transCreateNodeIdentifier(c, checked_name);
@@ -918,7 +914,7 @@ fn transRecordDecl(c: *Context, record_decl: *const clang.RecordDecl) Error!?*as
     }
 
     const name = try std.fmt.allocPrint(c.arena, "{}_{}", .{ container_kind_name, bare_name });
-    _ = try c.decl_table.put(@ptrToInt(record_decl.getCanonicalDecl()), name);
+    _ = try c.decl_table.put(c.gpa, @ptrToInt(record_decl.getCanonicalDecl()), name);
 
     const visib_tok = if (!is_unnamed) try appendToken(c, .Keyword_pub, "pub") else null;
     const mut_tok = try appendToken(c, .Keyword_const, "const");
@@ -930,6 +926,7 @@ fn transRecordDecl(c: *Context, record_decl: *const clang.RecordDecl) Error!?*as
     const init_node = blk: {
         const rp = makeRestorePoint(c);
         const record_def = record_decl.getDefinition() orelse {
+            _ = try c.opaque_demotes.put(c.gpa, @ptrToInt(record_decl.getCanonicalDecl()), {});
             const opaque_type = try transCreateNodeOpaqueType(c);
             semicolon = try appendToken(c, .Semicolon, ";");
             break :blk opaque_type;
@@ -954,6 +951,7 @@ fn transRecordDecl(c: *Context, record_decl: *const clang.RecordDecl) Error!?*as
             const field_qt = field_decl.getType();
 
             if (field_decl.isBitField()) {
+                _ = try c.opaque_demotes.put(c.gpa, @ptrToInt(record_decl.getCanonicalDecl()), {});
                 const opaque_type = try transCreateNodeOpaqueType(c);
                 semicolon = try appendToken(c, .Semicolon, ";");
                 try emitWarning(c, field_loc, "{} demoted to opaque type - has bitfield", .{container_kind_name});
@@ -961,6 +959,7 @@ fn transRecordDecl(c: *Context, record_decl: *const clang.RecordDecl) Error!?*as
             }
 
             if (qualTypeCanon(field_qt).isIncompleteOrZeroLengthArrayType(c.clang_context)) {
+                _ = try c.opaque_demotes.put(c.gpa, @ptrToInt(record_decl.getCanonicalDecl()), {});
                 const opaque_type = try transCreateNodeOpaqueType(c);
                 semicolon = try appendToken(c, .Semicolon, ";");
                 try emitWarning(c, field_loc, "{} demoted to opaque type - has variable length array", .{container_kind_name});
@@ -979,6 +978,7 @@ fn transRecordDecl(c: *Context, record_decl: *const clang.RecordDecl) Error!?*as
             _ = try appendToken(c, .Colon, ":");
             const field_type = transQualType(rp, field_qt, field_loc) catch |err| switch (err) {
                 error.UnsupportedType => {
+                    _ = try c.opaque_demotes.put(c.gpa, @ptrToInt(record_decl.getCanonicalDecl()), {});
                     const opaque_type = try transCreateNodeOpaqueType(c);
                     semicolon = try appendToken(c, .Semicolon, ";");
                     try emitWarning(c, record_loc, "{} demoted to opaque type - unable to translate type of field {}", .{ container_kind_name, raw_name });
@@ -988,13 +988,13 @@ fn transRecordDecl(c: *Context, record_decl: *const clang.RecordDecl) Error!?*as
             };
 
             const align_expr = blk_2: {
-                const alignment = field_decl.getAlignedAttribute(rp.c.clang_context);
+                const alignment = field_decl.getAlignedAttribute(c.clang_context);
                 if (alignment != 0) {
-                    _ = try appendToken(rp.c, .Keyword_align, "align");
-                    _ = try appendToken(rp.c, .LParen, "(");
+                    _ = try appendToken(c, .Keyword_align, "align");
+                    _ = try appendToken(c, .LParen, "(");
                     // Clang reports the alignment in bits
-                    const expr = try transCreateNodeInt(rp.c, alignment / 8);
-                    _ = try appendToken(rp.c, .RParen, ")");
+                    const expr = try transCreateNodeInt(c, alignment / 8);
+                    _ = try appendToken(c, .RParen, ")");
 
                     break :blk_2 expr;
                 }
@@ -1013,6 +1013,7 @@ fn transRecordDecl(c: *Context, record_decl: *const clang.RecordDecl) Error!?*as
 
             if (is_anon) {
                 _ = try c.decl_table.put(
+                    c.gpa,
                     @ptrToInt(field_decl.getCanonicalDecl()),
                     raw_name,
                 );
@@ -1065,7 +1066,7 @@ fn transEnumDecl(c: *Context, enum_decl: *const clang.EnumDecl) Error!?*ast.Node
     }
 
     const name = try std.fmt.allocPrint(c.arena, "enum_{}", .{bare_name});
-    _ = try c.decl_table.put(@ptrToInt(enum_decl.getCanonicalDecl()), name);
+    _ = try c.decl_table.put(c.gpa, @ptrToInt(enum_decl.getCanonicalDecl()), name);
 
     const visib_tok = if (!is_unnamed) try appendToken(c, .Keyword_pub, "pub") else null;
     const mut_tok = try appendToken(c, .Keyword_const, "const");
@@ -1204,8 +1205,10 @@ fn transEnumDecl(c: *Context, enum_decl: *const clang.EnumDecl) Error!?*ast.Node
         };
         mem.copy(*ast.Node, container_node.fieldsAndDecls(), fields_and_decls.items);
         break :blk &container_node.base;
-    } else
-        try transCreateNodeOpaqueType(c);
+    } else blk: {
+        _ = try c.opaque_demotes.put(c.gpa, @ptrToInt(enum_decl.getCanonicalDecl()), {});
+        break :blk try transCreateNodeOpaqueType(c);
+    };
 
     const semicolon_token = try appendToken(c, .Semicolon, ";");
     const node = try ast.Node.VarDecl.create(c.arena, .{
@@ -1990,6 +1993,21 @@ fn transStringLiteral(
     }
 }
 
+fn cIsEnum(qt: clang.QualType) bool {
+    return qt.getCanonicalType().getTypeClass() == .Enum;
+}
+
+/// Get the underlying int type of an enum. The C compiler chooses a signed int
+/// type that is large enough to hold all of the enum's values. It is not required
+/// to be the smallest possible type that can hold all the values.
+fn cIntTypeForEnum(enum_qt: clang.QualType) clang.QualType {
+    assert(cIsEnum(enum_qt));
+    const ty = enum_qt.getCanonicalType().getTypePtr();
+    const enum_ty = @ptrCast(*const clang.EnumType, ty);
+    const enum_decl = enum_ty.getDecl();
+    return enum_decl.getIntegerType();
+}
+
 fn transCCast(
     rp: RestorePoint,
     scope: *Scope,
@@ -2002,40 +2020,45 @@ fn transCCast(
     if (dst_type.eq(src_type)) return expr;
     if (qualTypeIsPtr(dst_type) and qualTypeIsPtr(src_type))
         return transCPtrCast(rp, loc, dst_type, src_type, expr);
-    if (cIsInteger(dst_type) and cIsInteger(src_type)) {
-        // 1. Extend or truncate without changing signed-ness.
-        // 2. Bit-cast to correct signed-ness
+    if (cIsInteger(dst_type) and (cIsInteger(src_type) or cIsEnum(src_type))) {
+        // 1. If src_type is an enum, determine the underlying signed int type
+        // 2. Extend or truncate without changing signed-ness.
+        // 3. Bit-cast to correct signed-ness
+
+        const src_type_is_signed = cIsSignedInteger(src_type) or cIsEnum(src_type);
+        const src_int_type = if (cIsInteger(src_type)) src_type else cIntTypeForEnum(src_type);
+        const src_int_expr = if (cIsInteger(src_type)) expr else try transEnumToInt(rp.c, expr);
 
         // @bitCast(dest_type, intermediate_value)
         const cast_node = try rp.c.createBuiltinCall("@bitCast", 2);
         cast_node.params()[0] = try transQualType(rp, dst_type, loc);
         _ = try appendToken(rp.c, .Comma, ",");
 
-        switch (cIntTypeCmp(dst_type, src_type)) {
+        switch (cIntTypeCmp(dst_type, src_int_type)) {
             .lt => {
-                // @truncate(SameSignSmallerInt, src_type)
+                // @truncate(SameSignSmallerInt, src_int_expr)
                 const trunc_node = try rp.c.createBuiltinCall("@truncate", 2);
-                const ty_node = try transQualTypeIntWidthOf(rp.c, dst_type, cIsSignedInteger(src_type));
+                const ty_node = try transQualTypeIntWidthOf(rp.c, dst_type, src_type_is_signed);
                 trunc_node.params()[0] = ty_node;
                 _ = try appendToken(rp.c, .Comma, ",");
-                trunc_node.params()[1] = expr;
+                trunc_node.params()[1] = src_int_expr;
                 trunc_node.rparen_token = try appendToken(rp.c, .RParen, ")");
 
                 cast_node.params()[1] = &trunc_node.base;
             },
             .gt => {
-                // @as(SameSignBiggerInt, src_type)
+                // @as(SameSignBiggerInt, src_int_expr)
                 const as_node = try rp.c.createBuiltinCall("@as", 2);
-                const ty_node = try transQualTypeIntWidthOf(rp.c, dst_type, cIsSignedInteger(src_type));
+                const ty_node = try transQualTypeIntWidthOf(rp.c, dst_type, src_type_is_signed);
                 as_node.params()[0] = ty_node;
                 _ = try appendToken(rp.c, .Comma, ",");
-                as_node.params()[1] = expr;
+                as_node.params()[1] = src_int_expr;
                 as_node.rparen_token = try appendToken(rp.c, .RParen, ")");
 
                 cast_node.params()[1] = &as_node.base;
             },
             .eq => {
-                cast_node.params()[1] = expr;
+                cast_node.params()[1] = src_int_expr;
             },
         }
         cast_node.rparen_token = try appendToken(rp.c, .RParen, ")");
@@ -2116,7 +2139,7 @@ fn transCCast(
 
         return &cast_node.base;
     }
-    if (dst_type.getCanonicalType().getTypeClass() == .Enum) {
+    if (cIsEnum(dst_type)) {
         const builtin_node = try rp.c.createBuiltinCall("@intToEnum", 2);
         builtin_node.params()[0] = try transQualType(rp, dst_type, loc);
         _ = try appendToken(rp.c, .Comma, ",");
@@ -2124,13 +2147,8 @@ fn transCCast(
         builtin_node.rparen_token = try appendToken(rp.c, .RParen, ")");
         return &builtin_node.base;
     }
-    if (src_type.getCanonicalType().getTypeClass() == .Enum and
-        dst_type.getCanonicalType().getTypeClass() != .Enum)
-    {
-        const builtin_node = try rp.c.createBuiltinCall("@enumToInt", 1);
-        builtin_node.params()[0] = expr;
-        builtin_node.rparen_token = try appendToken(rp.c, .RParen, ")");
-        return &builtin_node.base;
+    if (cIsEnum(src_type) and !cIsEnum(dst_type)) {
+        return transEnumToInt(rp.c, expr);
     }
     const cast_node = try rp.c.createBuiltinCall("@as", 2);
     cast_node.params()[0] = try transQualType(rp, dst_type, loc);
@@ -2138,6 +2156,13 @@ fn transCCast(
     cast_node.params()[1] = expr;
     cast_node.rparen_token = try appendToken(rp.c, .RParen, ")");
     return &cast_node.base;
+}
+
+fn transEnumToInt(c: *Context, enum_expr: *ast.Node) TypeError!*ast.Node {
+    const builtin_node = try c.createBuiltinCall("@enumToInt", 1);
+    builtin_node.params()[0] = enum_expr;
+    builtin_node.rparen_token = try appendToken(c, .RParen, ")");
+    return &builtin_node.base;
 }
 
 fn transExpr(
@@ -4767,7 +4792,7 @@ fn transType(rp: RestorePoint, ty: *const clang.Type, source_loc: clang.SourceLo
                 optional_node.rhs = try transQualType(rp, child_qt, source_loc);
                 return &optional_node.base;
             }
-            if (typeIsOpaque(rp.c, child_qt.getTypePtr(), source_loc)) {
+            if (typeIsOpaque(rp.c, child_qt.getTypePtr(), source_loc) or qualTypeWasDemotedToOpaque(rp.c, child_qt)) {
                 const optional_node = try transCreateNodeSimplePrefixOp(rp.c, .OptionalType, .QuestionMark, "?");
                 const pointer_node = try transCreateNodePtrType(
                     rp.c,
@@ -4850,6 +4875,50 @@ fn transType(rp: RestorePoint, ty: *const clang.Type, source_loc: clang.SourceLo
             const type_name = rp.c.str(ty.getTypeClassName());
             return revertAndWarn(rp, error.UnsupportedType, source_loc, "unsupported type: '{}'", .{type_name});
         },
+    }
+}
+
+fn qualTypeWasDemotedToOpaque(c: *Context, qt: clang.QualType) bool {
+    const ty = qt.getTypePtr();
+    switch (qt.getTypeClass()) {
+        .Typedef => {
+            const typedef_ty = @ptrCast(*const clang.TypedefType, ty);
+
+            const typedef_decl = typedef_ty.getDecl();
+            const underlying_type = typedef_decl.getUnderlyingType();
+            return qualTypeWasDemotedToOpaque(c, underlying_type);
+        },
+        .Record => {
+            const record_ty = @ptrCast(*const clang.RecordType, ty);
+
+            const record_decl = record_ty.getDecl();
+            const canonical = @ptrToInt(record_decl.getCanonicalDecl());
+            return c.opaque_demotes.contains(canonical);
+        },
+        .Enum => {
+            const enum_ty = @ptrCast(*const clang.EnumType, ty);
+
+            const enum_decl = enum_ty.getDecl();
+            const canonical = @ptrToInt(enum_decl.getCanonicalDecl());
+            return c.opaque_demotes.contains(canonical);
+        },
+        .Elaborated => {
+            const elaborated_ty = @ptrCast(*const clang.ElaboratedType, ty);
+            return qualTypeWasDemotedToOpaque(c, elaborated_ty.getNamedType());
+        },
+        .Decayed => {
+            const decayed_ty = @ptrCast(*const clang.DecayedType, ty);
+            return qualTypeWasDemotedToOpaque(c, decayed_ty.getDecayedType());
+        },
+        .Attributed => {
+            const attributed_ty = @ptrCast(*const clang.AttributedType, ty);
+            return qualTypeWasDemotedToOpaque(c, attributed_ty.getEquivalentType());
+        },
+        .MacroQualified => {
+            const macroqualified_ty = @ptrCast(*const clang.MacroQualifiedType, ty);
+            return qualTypeWasDemotedToOpaque(c, macroqualified_ty.getModifiedType());
+        },
+        else => return false,
     }
 }
 
@@ -5390,9 +5459,8 @@ fn transMacroFnDefine(c: *Context, m: *MacroCtx) ParseError!void {
     defer fn_params.deinit();
 
     while (true) {
-        if (m.next().? != .Identifier) {
-            return m.fail(c, "unable to translate C expr: expected identifier", .{});
-        }
+        if (m.peek().? != .Identifier) break;
+        _ = m.next();
 
         const mangled_name = try block_scope.makeMangledName(c, m.slice());
         const param_name_tok = try appendIdentifier(c, mangled_name);
@@ -5412,8 +5480,7 @@ fn transMacroFnDefine(c: *Context, m: *MacroCtx) ParseError!void {
             .param_type = .{ .any_type = &any_type.base },
         };
 
-        if (m.peek().? != .Comma)
-            break;
+        if (m.peek().? != .Comma) break;
         _ = m.next();
         _ = try appendToken(c, .Comma, ",");
     }
@@ -5802,6 +5869,22 @@ fn parseCPrimaryExprInner(c: *Context, m: *MacroCtx, scope: *Scope) ParseError!*
         } else {
             return transCreateNodeIdentifierUnchecked(c, "c_int");
         },
+        .Keyword_enum, .Keyword_struct, .Keyword_union => {
+            // struct Foo will be declared as struct_Foo by transRecordDecl
+            const next_id = m.next().?;
+            if (next_id != .Identifier) {
+                try m.fail(c, "unable to translate C expr: expected Identifier instead got: {}", .{@tagName(next_id)});
+                return error.ParseError;
+            }
+
+            const ident_token = try appendTokenFmt(c, .Identifier, "{}_{}", .{slice, m.slice()});
+            const identifier = try c.arena.create(ast.Node.OneToken);
+            identifier.* = .{
+                .base = .{ .tag = .Identifier },
+                .token = ident_token,
+            };
+            return &identifier.base;
+        },
         .Identifier => {
             const mangled_name = scope.getAlias(slice);
             return transCreateNodeIdentifier(c, checkForBuiltinTypedef(mangled_name) orelse mangled_name);
@@ -5811,7 +5894,7 @@ fn parseCPrimaryExprInner(c: *Context, m: *MacroCtx, scope: *Scope) ParseError!*
 
             const next_id = m.next().?;
             if (next_id != .RParen) {
-                try m.fail(c, "unable to translate C expr: expected ')'' instead got: {}", .{@tagName(next_id)});
+                try m.fail(c, "unable to translate C expr: expected ')' instead got: {}", .{@tagName(next_id)});
                 return error.ParseError;
             }
             var saw_l_paren = false;
@@ -5841,7 +5924,7 @@ fn parseCPrimaryExprInner(c: *Context, m: *MacroCtx, scope: *Scope) ParseError!*
             const node_to_cast = try parseCExpr(c, m, scope);
 
             if (saw_l_paren and m.next().? != .RParen) {
-                try m.fail(c, "unable to translate C expr: expected ')''", .{});
+                try m.fail(c, "unable to translate C expr: expected ')'", .{});
                 return error.ParseError;
             }
 
@@ -6519,7 +6602,7 @@ fn parseCUnaryExpr(c: *Context, m: *MacroCtx, scope: *Scope) ParseError!*ast.Nod
 
 fn tokenSlice(c: *Context, token: ast.TokenIndex) []u8 {
     const tok = c.token_locs.items[token];
-    const slice = c.source_buffer.span()[tok.start..tok.end];
+    const slice = c.source_buffer.items[tok.start..tok.end];
     return if (mem.startsWith(u8, slice, "@\""))
         slice[2 .. slice.len - 1]
     else

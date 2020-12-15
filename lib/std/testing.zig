@@ -4,6 +4,7 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 const std = @import("std.zig");
+const math = std.math;
 const print = std.debug.print;
 
 pub const FailingAllocator = @import("testing/failing_allocator.zig").FailingAllocator;
@@ -53,7 +54,12 @@ pub fn expectEqual(expected: anytype, actual: @TypeOf(expected)) void {
         .Void,
         => return,
 
-        .Type,
+        .Type => {
+            if (actual != expected) {
+                std.debug.panic("expected type {}, found type {}", .{ @typeName(expected), @typeName(actual) });
+            }
+        },
+
         .Bool,
         .Int,
         .Float,
@@ -193,11 +199,16 @@ pub fn expectWithinMargin(expected: anytype, actual: @TypeOf(expected), margin: 
     }
 }
 
-test "expectWithinMargin.f32" {
-    const x: f32 = 12.0;
-    const y: f32 = 12.06;
+test "expectWithinMargin" {
+    inline for ([_]type{ f16, f32, f64, f128 }) |T| {
+        const pos_x: T = 12.0;
+        const pos_y: T = 12.06;
+        const neg_x: T = -12.0;
+        const neg_y: T = -12.06;
 
-    expectWithinMargin(x, y, 0.1);
+        expectWithinMargin(pos_x, pos_y, 0.1);
+        expectWithinMargin(neg_x, neg_y, 0.1);
+    }
 }
 
 /// This function is intended to be used only in tests. When the actual value is not
@@ -207,7 +218,8 @@ test "expectWithinMargin.f32" {
 pub fn expectWithinEpsilon(expected: anytype, actual: @TypeOf(expected), epsilon: @TypeOf(expected)) void {
     std.debug.assert(epsilon >= 0.0 and epsilon <= 1.0);
 
-    const margin = epsilon * expected;
+    // Relative epsilon test.
+    const margin = math.max(math.fabs(expected), math.fabs(actual)) * epsilon;
     switch (@typeInfo(@TypeOf(actual))) {
         .Float,
         .ComptimeFloat,
@@ -220,16 +232,22 @@ pub fn expectWithinEpsilon(expected: anytype, actual: @TypeOf(expected), epsilon
     }
 }
 
-test "expectWithinEpsilon.f32" {
-    const x: f32 = 12.0;
-    const y: f32 = 13.2;
+test "expectWithinEpsilon" {
+    inline for ([_]type{ f16, f32, f64, f128 }) |T| {
+        const pos_x: T = 12.0;
+        const pos_y: T = 13.2;
+        const neg_x: T = -12.0;
+        const neg_y: T = -13.2;
 
-    expectWithinEpsilon(x, y, 0.1);
+        expectWithinEpsilon(pos_x, pos_y, 0.1);
+        expectWithinEpsilon(neg_x, neg_y, 0.1);
+    }
 }
 
 /// This function is intended to be used only in tests. When the two slices are not
 /// equal, prints diagnostics to stderr to show exactly how they are not equal,
 /// then aborts.
+/// If your inputs are UTF-8 encoded strings, consider calling `expectEqualStrings` instead.
 pub fn expectEqualSlices(comptime T: type, expected: []const T, actual: []const T) void {
     // TODO better printing of the difference
     // If the arrays are small enough we could print the whole thing
@@ -349,6 +367,26 @@ pub fn expectEqualStrings(expected: []const u8, actual: []const u8) void {
 
         @panic("test failure");
     }
+}
+
+pub fn expectStringEndsWith(actual: []const u8, expected_ends_with: []const u8) void {
+    if (std.mem.endsWith(u8, actual, expected_ends_with))
+        return;
+
+    const shortened_actual = if (actual.len >= expected_ends_with.len)
+        actual[0..expected_ends_with.len]
+    else
+        actual;
+
+    print("\n====== expected to end with: =========\n", .{});
+    printWithVisibleNewlines(expected_ends_with);
+    print("\n====== instead ended with: ===========\n", .{});
+    printWithVisibleNewlines(shortened_actual);
+    print("\n========= full output: ==============\n", .{});
+    printWithVisibleNewlines(actual);
+    print("\n======================================\n", .{});
+
+    @panic("test failure");
 }
 
 fn printIndicatorLine(source: []const u8, indicator_index: usize) void {

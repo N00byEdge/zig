@@ -11,7 +11,7 @@ const builtin = std.builtin;
 const assert = std.debug.assert;
 const uefi = std.os.uefi;
 
-var starting_stack_ptr: [*]usize = undefined;
+var argc_argv_ptr: [*]usize = undefined;
 
 const start_sym_name = if (builtin.arch.isMIPS()) "__start" else "_start";
 
@@ -53,8 +53,8 @@ fn _DllMainCRTStartup(
     hinstDLL: std.os.windows.HINSTANCE,
     fdwReason: std.os.windows.DWORD,
     lpReserved: std.os.windows.LPVOID,
-) callconv(.Stdcall) std.os.windows.BOOL {
-    if (!builtin.single_threaded) {
+) callconv(std.os.windows.WINAPI) std.os.windows.BOOL {
+    if (!builtin.single_threaded and !builtin.link_libc) {
         _ = @import("start_windows_tls.zig");
     }
 
@@ -102,46 +102,57 @@ fn _start() callconv(.Naked) noreturn {
 
     switch (builtin.arch) {
         .x86_64 => {
-            starting_stack_ptr = asm (""
+            argc_argv_ptr = asm volatile (
+                \\ xor %%rbp, %%rbp
                 : [argc] "={rsp}" (-> [*]usize)
             );
         },
         .i386 => {
-            starting_stack_ptr = asm (""
+            argc_argv_ptr = asm volatile (
+                \\ xor %%ebp, %%ebp
                 : [argc] "={esp}" (-> [*]usize)
             );
         },
-        .aarch64, .aarch64_be, .arm => {
-            starting_stack_ptr = asm ("mov %[argc], sp"
-                : [argc] "=r" (-> [*]usize)
+        .aarch64, .aarch64_be, .arm, .armeb => {
+            argc_argv_ptr = asm volatile (
+                \\ mov fp, #0
+                \\ mov lr, #0
+                : [argc] "={sp}" (-> [*]usize)
             );
         },
         .riscv64 => {
-            starting_stack_ptr = asm ("mv %[argc], sp"
-                : [argc] "=r" (-> [*]usize)
+            argc_argv_ptr = asm volatile (
+                \\ li s0, 0
+                \\ li ra, 0
+                : [argc] "={sp}" (-> [*]usize)
             );
         },
         .mips, .mipsel => {
-            // Need noat here because LLVM is free to pick any register
-            starting_stack_ptr = asm (
-                \\ .set noat
-                \\ move %[argc], $sp
-                : [argc] "=r" (-> [*]usize)
+            // The lr is already zeroed on entry, as specified by the ABI.
+            argc_argv_ptr = asm volatile (
+                \\ move $fp, $0
+                : [argc] "={sp}" (-> [*]usize)
             );
         },
         .powerpc64le => {
-            // Before returning the stack pointer, we have to set up a backchain
-            // and a few other registers required by the ELFv2 ABI.
+            // Setup the initial stack frame and clear the back chain pointer.
             // TODO: Support powerpc64 (big endian) on ELFv2.
-            starting_stack_ptr = asm (
+            argc_argv_ptr = asm volatile (
                 \\ mr 4, 1
-                \\ subi 1, 1, 32
-                \\ li 5, 0
-                \\ std 5, 0(1)
-                \\ mr %[argc], 4
-                : [argc] "=r" (-> [*]usize)
+                \\ li 0, 0
+                \\ stdu 0, -32(1)
+                \\ mtlr 0
+                : [argc] "={r4}" (-> [*]usize)
                 :
-                : "r4", "r5"
+                : "r0"
+            );
+        },
+        .sparcv9 => {
+            // argc is stored after a register window (16 registers) plus stack bias
+            argc_argv_ptr = asm (
+                \\ mov %%g0, %%i6
+                \\ add %%o6, 2175, %[argc]
+                : [argc] "=r" (-> [*]usize)
             );
         },
         else => @compileError("unsupported arch"),
@@ -151,7 +162,7 @@ fn _start() callconv(.Naked) noreturn {
     @call(.{ .modifier = .never_inline }, posixCallMainAndExit, .{});
 }
 
-fn WinStartup() callconv(.Stdcall) noreturn {
+fn WinStartup() callconv(std.os.windows.WINAPI) noreturn {
     @setAlignStack(16);
     if (!builtin.single_threaded) {
         _ = @import("start_windows_tls.zig");
@@ -162,7 +173,7 @@ fn WinStartup() callconv(.Stdcall) noreturn {
     std.os.windows.kernel32.ExitProcess(initEventLoopAndCallMain());
 }
 
-fn wWinMainCRTStartup() callconv(.Stdcall) noreturn {
+fn wWinMainCRTStartup() callconv(std.os.windows.WINAPI) noreturn {
     @setAlignStack(16);
     if (!builtin.single_threaded) {
         _ = @import("start_windows_tls.zig");
@@ -170,16 +181,16 @@ fn wWinMainCRTStartup() callconv(.Stdcall) noreturn {
 
     std.debug.maybeEnableSegfaultHandler();
 
-    std.os.windows.kernel32.ExitProcess(initEventLoopAndCallWinMain());
+    const result: std.os.windows.INT = initEventLoopAndCallWinMain();
+    std.os.windows.kernel32.ExitProcess(@bitCast(std.os.windows.UINT, result));
 }
 
 // TODO https://github.com/ziglang/zig/issues/265
 fn posixCallMainAndExit() noreturn {
-    if (builtin.os.tag == .freebsd) {
-        @setAlignStack(16);
-    }
-    const argc = starting_stack_ptr[0];
-    const argv = @ptrCast([*][*:0]u8, starting_stack_ptr + 1);
+    @setAlignStack(16);
+
+    const argc = argc_argv_ptr[0];
+    const argv = @ptrCast([*][*:0]u8, argc_argv_ptr + 1);
 
     const envp_optional = @ptrCast([*:null]?[*:0]u8, @alignCast(@alignOf(usize), argv + argc + 1));
     var envp_count: usize = 0;
@@ -190,8 +201,19 @@ fn posixCallMainAndExit() noreturn {
         // Find the beginning of the auxiliary vector
         const auxv = @ptrCast([*]std.elf.Auxv, @alignCast(@alignOf(usize), envp.ptr + envp_count + 1));
         std.os.linux.elf_aux_maybe = auxv;
-        // Initialize the TLS area
-        std.os.linux.tls.initStaticTLS();
+
+        // Do this as early as possible, the aux vector is needed
+        if (builtin.position_independent_executable) {
+            @import("os/linux/start_pie.zig").apply_relocations();
+        }
+
+        // Initialize the TLS area. We do a runtime check here to make sure
+        // this code is truly being statically executed and not inside a dynamic
+        // loader, otherwise this would clobber the thread ID register.
+        const is_dynamic = @import("dynamic_library.zig").get_DYNAMIC() != null;
+        if (!is_dynamic) {
+            std.os.linux.tls.initStaticTLS();
+        }
 
         // TODO This is disabled because what should we do when linking libc and this code
         // does not execute? And also it's causing a test failure in stack traces in release modes.
@@ -313,7 +335,7 @@ pub fn callMain() u8 {
             return 0;
         },
         .Int => |info| {
-            if (info.bits != 8 or info.is_signed) {
+            if (info.bits != 8 or info.signedness == .signed) {
                 @compileError(bad_main_ret);
             }
             return root.main();
@@ -329,7 +351,7 @@ pub fn callMain() u8 {
             switch (@typeInfo(@TypeOf(result))) {
                 .Void => return 0,
                 .Int => |info| {
-                    if (info.bits != 8 or info.is_signed) {
+                    if (info.bits != 8 or info.signedness == .signed) {
                         @compileError(bad_main_ret);
                     }
                     return result;
@@ -342,13 +364,14 @@ pub fn callMain() u8 {
 }
 
 pub fn call_wWinMain() std.os.windows.INT {
-    const hInstance = @ptrCast(std.os.windows.HINSTANCE, std.os.windows.kernel32.GetModuleHandleW(null).?);
-    const hPrevInstance: ?std.os.windows.HINSTANCE = null; // MSDN: "This parameter is always NULL"
+    const MAIN_HINSTANCE = @typeInfo(@TypeOf(root.wWinMain)).Fn.args[0].arg_type.?;
+    const hInstance = @ptrCast(MAIN_HINSTANCE, std.os.windows.kernel32.GetModuleHandleW(null).?);
     const lpCmdLine = std.os.windows.kernel32.GetCommandLineW();
 
     // There's no (documented) way to get the nCmdShow parameter, so we're
     // using this fairly standard default.
     const nCmdShow = std.os.windows.user32.SW_SHOW;
 
-    return root.wWinMain(hInstance, hPrevInstance, lpCmdLine, nCmdShow);
+    // second parameter hPrevInstance, MSDN: "This parameter is always NULL"
+    return root.wWinMain(hInstance, null, lpCmdLine, nCmdShow);
 }

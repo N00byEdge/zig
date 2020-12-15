@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2015-2020 Zig Contributors
+// This file is part of [zig](https://ziglang.org/), which is MIT licensed.
+// The MIT license requires this copyright notice to be included in all copies
+// and substantial portions of the software.
+
 const std = @import("../std.zig");
 const assert = std.debug.assert;
 const hmac = std.crypto.auth.hmac;
@@ -14,14 +20,14 @@ pub const HkdfSha512 = Hkdf(hmac.sha2.HmacSha512);
 pub fn Hkdf(comptime Hmac: type) type {
     return struct {
         /// Return a master key from a salt and initial keying material.
-        fn extract(salt: []const u8, ikm: []const u8) [Hmac.mac_length]u8 {
+        pub fn extract(salt: []const u8, ikm: []const u8) [Hmac.mac_length]u8 {
             var prk: [Hmac.mac_length]u8 = undefined;
             Hmac.create(&prk, ikm, salt);
             return prk;
         }
 
         /// Derive a subkey from a master key `prk` and a subkey description `ctx`.
-        fn expand(out: []u8, ctx: []const u8, prk: [Hmac.mac_length]u8) void {
+        pub fn expand(out: []u8, ctx: []const u8, prk: [Hmac.mac_length]u8) void {
             assert(out.len < Hmac.mac_length * 255); // output size is too large for the Hkdf construction
             var i: usize = 0;
             var counter = [1]u8{1};

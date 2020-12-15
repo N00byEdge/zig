@@ -44,7 +44,7 @@ pub fn Blake2s(comptime out_bits: usize) type {
         pub const key_length_min = 0;
         pub const key_length_max = 32;
         pub const key_length = 32; // recommended key length
-        pub const Options = struct { key: ?[]const u8 = null, salt: ?[8]u8 = null, context: ?[8]u8 = null };
+        pub const Options = struct { key: ?[]const u8 = null, salt: ?[8]u8 = null, context: ?[8]u8 = null, expected_out_bits: usize = out_bits };
 
         const iv = [8]u32{
             0x6A09E667,
@@ -77,14 +77,14 @@ pub fn Blake2s(comptime out_bits: usize) type {
         buf_len: u8,
 
         pub fn init(options: Options) Self {
-            debug.assert(8 <= out_bits and out_bits <= 256);
+            comptime debug.assert(8 <= out_bits and out_bits <= 256);
 
             var d: Self = undefined;
             mem.copy(u32, d.h[0..], iv[0..]);
 
             const key_len = if (options.key) |key| key.len else 0;
             // default parameters
-            d.h[0] ^= 0x01010000 ^ @truncate(u32, key_len << 8) ^ @intCast(u32, out_bits >> 3);
+            d.h[0] ^= 0x01010000 ^ @truncate(u32, key_len << 8) ^ @intCast(u32, options.expected_out_bits >> 3);
             d.t = 0;
             d.buf_len = 0;
 
@@ -125,7 +125,7 @@ pub fn Blake2s(comptime out_bits: usize) type {
             // Full middle blocks.
             while (off + 64 < b.len) : (off += 64) {
                 d.t += 64;
-                d.round(b[off .. off + 64], false);
+                d.round(b[off..][0..64], false);
             }
 
             // Copy any remainder for next pass.
@@ -145,9 +145,7 @@ pub fn Blake2s(comptime out_bits: usize) type {
             }
         }
 
-        fn round(d: *Self, b: []const u8, last: bool) void {
-            debug.assert(b.len == 64);
-
+        fn round(d: *Self, b: *const [64]u8, last: bool) void {
             var m: [16]u32 = undefined;
             var v: [16]u32 = undefined;
 
@@ -263,7 +261,7 @@ test "blake2s224 streaming" {
 
 test "comptime blake2s224" {
     comptime {
-        @setEvalBranchQuota(6000);
+        @setEvalBranchQuota(10000);
         var block = [_]u8{0} ** Blake2s224.block_length;
         var out: [Blake2s224.digest_length]u8 = undefined;
 
@@ -355,7 +353,7 @@ test "blake2s256 keyed" {
 
 test "comptime blake2s256" {
     comptime {
-        @setEvalBranchQuota(6000);
+        @setEvalBranchQuota(10000);
         var block = [_]u8{0} ** Blake2s256.block_length;
         var out: [Blake2s256.digest_length]u8 = undefined;
 
@@ -387,7 +385,7 @@ pub fn Blake2b(comptime out_bits: usize) type {
         pub const key_length_min = 0;
         pub const key_length_max = 64;
         pub const key_length = 32; // recommended key length
-        pub const Options = struct { key: ?[]const u8 = null, salt: ?[16]u8 = null, context: ?[16]u8 = null };
+        pub const Options = struct { key: ?[]const u8 = null, salt: ?[16]u8 = null, context: ?[16]u8 = null, expected_out_bits: usize = out_bits };
 
         const iv = [8]u64{
             0x6a09e667f3bcc908,
@@ -422,14 +420,14 @@ pub fn Blake2b(comptime out_bits: usize) type {
         buf_len: u8,
 
         pub fn init(options: Options) Self {
-            debug.assert(8 <= out_bits and out_bits <= 512);
+            comptime debug.assert(8 <= out_bits and out_bits <= 512);
 
             var d: Self = undefined;
             mem.copy(u64, d.h[0..], iv[0..]);
 
             const key_len = if (options.key) |key| key.len else 0;
             // default parameters
-            d.h[0] ^= 0x01010000 ^ (key_len << 8) ^ (out_bits >> 3);
+            d.h[0] ^= 0x01010000 ^ (key_len << 8) ^ (options.expected_out_bits >> 3);
             d.t = 0;
             d.buf_len = 0;
 
@@ -470,7 +468,7 @@ pub fn Blake2b(comptime out_bits: usize) type {
             // Full middle blocks.
             while (off + 128 < b.len) : (off += 128) {
                 d.t += 128;
-                d.round(b[off .. off + 128], false);
+                d.round(b[off..][0..128], false);
             }
 
             // Copy any remainder for next pass.
@@ -490,9 +488,7 @@ pub fn Blake2b(comptime out_bits: usize) type {
             }
         }
 
-        fn round(d: *Self, b: []const u8, last: bool) void {
-            debug.assert(b.len == 128);
-
+        fn round(d: *Self, b: *const [128]u8, last: bool) void {
             var m: [16]u64 = undefined;
             var v: [16]u64 = undefined;
 
@@ -615,7 +611,7 @@ test "blake2b384 streaming" {
 
 test "comptime blake2b384" {
     comptime {
-        @setEvalBranchQuota(7000);
+        @setEvalBranchQuota(10000);
         var block = [_]u8{0} ** Blake2b384.block_length;
         var out: [Blake2b384.digest_length]u8 = undefined;
 
@@ -707,7 +703,7 @@ test "blake2b512 keyed" {
 
 test "comptime blake2b512" {
     comptime {
-        @setEvalBranchQuota(8000);
+        @setEvalBranchQuota(10000);
         var block = [_]u8{0} ** Blake2b512.block_length;
         var out: [Blake2b512.digest_length]u8 = undefined;
 

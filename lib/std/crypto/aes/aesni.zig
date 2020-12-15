@@ -100,8 +100,18 @@ pub const Block = struct {
 
     /// Perform operations on multiple blocks in parallel.
     pub const parallel = struct {
+        const cpu = std.Target.x86.cpu;
+
         /// The recommended number of AES encryption/decryption to perform in parallel for the chosen implementation.
-        pub const optimal_parallel_blocks = 8;
+        pub const optimal_parallel_blocks = switch (std.Target.current.cpu.model) {
+            &cpu.westmere => 6,
+            &cpu.sandybridge, &cpu.ivybridge => 8,
+            &cpu.haswell, &cpu.broadwell => 7,
+            &cpu.cannonlake, &cpu.skylake, &cpu.skylake_avx512 => 4,
+            &cpu.icelake_client, &cpu.icelake_server => 6,
+            &cpu.znver1, &cpu.znver2 => 8,
+            else => 8,
+        };
 
         /// Encrypt multiple blocks in parallel, each their own round key.
         pub inline fn encryptParallel(comptime count: usize, blocks: [count]Block, round_keys: [count]Block) [count]Block {
@@ -123,7 +133,7 @@ pub const Block = struct {
             return out;
         }
 
-        /// Encrypt multple blocks in parallel with the same round key.
+        /// Encrypt multiple blocks in parallel with the same round key.
         pub inline fn encryptWide(comptime count: usize, blocks: [count]Block, round_key: Block) [count]Block {
             comptime var i = 0;
             var out: [count]Block = undefined;
@@ -133,7 +143,7 @@ pub const Block = struct {
             return out;
         }
 
-        /// Decrypt multple blocks in parallel with the same round key.
+        /// Decrypt multiple blocks in parallel with the same round key.
         pub inline fn decryptWide(comptime count: usize, blocks: [count]Block, round_key: Block) [count]Block {
             comptime var i = 0;
             var out: [count]Block = undefined;
@@ -143,7 +153,7 @@ pub const Block = struct {
             return out;
         }
 
-        /// Encrypt multple blocks in parallel with the same last round key.
+        /// Encrypt multiple blocks in parallel with the same last round key.
         pub inline fn encryptLastWide(comptime count: usize, blocks: [count]Block, round_key: Block) [count]Block {
             comptime var i = 0;
             var out: [count]Block = undefined;
@@ -153,7 +163,7 @@ pub const Block = struct {
             return out;
         }
 
-        /// Decrypt multple blocks in parallel with the same last round key.
+        /// Decrypt multiple blocks in parallel with the same last round key.
         pub inline fn decryptLastWide(comptime count: usize, blocks: [count]Block, round_key: Block) [count]Block {
             comptime var i = 0;
             var out: [count]Block = undefined;

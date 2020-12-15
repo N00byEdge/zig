@@ -237,7 +237,7 @@ pub const Target = struct {
                     .macos => return .{
                         .semver = .{
                             .min = .{ .major = 10, .minor = 13 },
-                            .max = .{ .major = 10, .minor = 15, .patch = 3 },
+                            .max = .{ .major = 10, .minor = 15, .patch = 7 },
                         },
                     },
                     .ios => return .{
@@ -637,8 +637,27 @@ pub const Target = struct {
                         return x;
                     }
 
+                    /// Returns true if the specified feature is enabled.
                     pub fn featureSetHas(set: Set, feature: F) bool {
                         return set.isEnabled(@enumToInt(feature));
+                    }
+
+                    /// Returns true if any specified feature is enabled.
+                    pub fn featureSetHasAny(set: Set, features: anytype) bool {
+                        comptime std.debug.assert(std.meta.trait.isIndexable(@TypeOf(features)));
+                        inline for (features) |feature| {
+                            if (set.isEnabled(@enumToInt(@as(F, feature)))) return true;
+                        }
+                        return false;
+                    }
+
+                    /// Returns true if every specified feature is enabled.
+                    pub fn featureSetHasAll(set: Set, features: anytype) bool {
+                        comptime std.debug.assert(std.meta.trait.isIndexable(@TypeOf(features)));
+                        inline for (features) |feature| {
+                            if (!set.isEnabled(@enumToInt(@as(F, feature)))) return false;
+                        }
+                        return true;
                     }
                 };
             }
@@ -731,6 +750,20 @@ pub const Target = struct {
             pub fn isMIPS(arch: Arch) bool {
                 return switch (arch) {
                     .mips, .mipsel, .mips64, .mips64el => true,
+                    else => false,
+                };
+            }
+
+            pub fn isPPC64(arch: Arch) bool {
+                return switch (arch) {
+                    .powerpc64, .powerpc64le => true,
+                    else => false,
+                };
+            }
+
+            pub fn isSPARC(arch: Arch) bool {
+                return switch (arch) {
+                    .sparc, .sparcel, .sparcv9 => true,
                     else => false,
                 };
             }
@@ -1090,11 +1123,14 @@ pub const Target = struct {
                     .mips, .mipsel => &mips.cpu.mips32,
                     .mips64, .mips64el => &mips.cpu.mips64,
                     .msp430 => &msp430.cpu.generic,
-                    .powerpc, .powerpc64, .powerpc64le => &powerpc.cpu.generic,
+                    .powerpc => &powerpc.cpu.ppc32,
+                    .powerpc64 => &powerpc.cpu.ppc64,
+                    .powerpc64le => &powerpc.cpu.ppc64le,
                     .amdgcn => &amdgpu.cpu.generic,
                     .riscv32 => &riscv.cpu.generic_rv32,
                     .riscv64 => &riscv.cpu.generic_rv64,
-                    .sparc, .sparcv9, .sparcel => &sparc.cpu.generic,
+                    .sparc, .sparcel => &sparc.cpu.v8,
+                    .sparcv9 => &sparc.cpu.v9,
                     .s390x => &systemz.cpu.generic,
                     .i386 => &x86.cpu._i386,
                     .x86_64 => &x86.cpu.x86_64,

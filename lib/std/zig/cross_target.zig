@@ -500,8 +500,12 @@ pub const CrossTarget = struct {
             self.dynamic_linker.get() == null and self.glibc_version == null;
     }
 
+    pub fn isNativeAbi(self: CrossTarget) bool {
+        return self.os_tag == null and self.abi == null;
+    }
+
     pub fn isNative(self: CrossTarget) bool {
-        return self.isNativeCpu() and self.isNativeOs() and self.abi == null;
+        return self.isNativeCpu() and self.isNativeOs() and self.isNativeAbi();
     }
 
     pub fn zigTriple(self: CrossTarget, allocator: *mem.Allocator) error{OutOfMemory}![]u8 {
@@ -826,6 +830,11 @@ test "CrossTarget.parse" {
         std.testing.expect(!Target.x86.featureSetHas(target.cpu.features, .cx8));
         std.testing.expect(Target.x86.featureSetHas(target.cpu.features, .cmov));
         std.testing.expect(Target.x86.featureSetHas(target.cpu.features, .fxsr));
+
+        std.testing.expect(Target.x86.featureSetHasAny(target.cpu.features, .{ .sse, .avx, .cmov }));
+        std.testing.expect(!Target.x86.featureSetHasAny(target.cpu.features, .{ .sse, .avx }));
+        std.testing.expect(Target.x86.featureSetHasAll(target.cpu.features, .{ .mmx, .x87 }));
+        std.testing.expect(!Target.x86.featureSetHasAll(target.cpu.features, .{ .mmx, .x87, .sse }));
 
         const text = try cross_target.zigTriple(std.testing.allocator);
         defer std.testing.allocator.free(text);

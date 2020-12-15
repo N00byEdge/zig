@@ -78,6 +78,9 @@ import_table: std.StringArrayHashMapUnmanaged(*Scope.File) = .{},
 /// previous analysis.
 generation: u32 = 0,
 
+/// When populated it means there was an error opening/reading the root source file.
+failed_root_src_file: ?anyerror = null,
+
 stage1_flags: packed struct {
     have_winmain: bool = false,
     have_wwinmain: bool = false,
@@ -469,6 +472,22 @@ pub const Scope = struct {
         }
     }
 
+    pub fn getOwnerPkg(base: *Scope) *Package {
+        var cur = base;
+        while (true) {
+            cur = switch (cur.tag) {
+                .container => return @fieldParentPtr(Container, "base", cur).file_scope.pkg,
+                .file => return @fieldParentPtr(File, "base", cur).pkg,
+                .zir_module => unreachable, // TODO are zir modules allowed to import packages?
+                .gen_zir => @fieldParentPtr(GenZIR, "base", cur).parent,
+                .local_val => @fieldParentPtr(LocalVal, "base", cur).parent,
+                .local_ptr => @fieldParentPtr(LocalPtr, "base", cur).parent,
+                .block => @fieldParentPtr(Block, "base", cur).decl.scope,
+                .decl => @fieldParentPtr(DeclAnalysis, "base", cur).decl.scope,
+            };
+        }
+    }
+
     /// Asserts the scope is a namespace Scope and removes the Decl from the namespace.
     pub fn removeDecl(base: *Scope, child: *Decl) void {
         switch (base.tag) {
@@ -576,6 +595,8 @@ pub const Scope = struct {
             unloaded_parse_failure,
             loaded_success,
         },
+        /// Package that this file is a part of, managed externally.
+        pkg: *Package,
 
         root_container: Container,
 
@@ -614,7 +635,7 @@ pub const Scope = struct {
         pub fn getSource(self: *File, module: *Module) ![:0]const u8 {
             switch (self.source) {
                 .unloaded => {
-                    const source = try module.root_pkg.root_src_directory.handle.readFileAllocOptions(
+                    const source = try self.pkg.root_src_directory.handle.readFileAllocOptions(
                         module.gpa,
                         self.sub_file_path,
                         std.math.maxInt(u32),
@@ -1036,6 +1057,10 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 .param_types = param_types,
             }, .{});
 
+            if (self.comp.verbose_ir) {
+                zir.dumpZir(self.gpa, "fn_type", decl.name, fn_type_scope.instructions.items) catch {};
+            }
+
             // We need the memory for the Type to go into the arena for the Decl
             var decl_arena = std.heap.ArenaAllocator.init(self.gpa);
             errdefer decl_arena.deinit();
@@ -1107,6 +1132,10 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 {
                     const src = tree.token_locs[body_block.rbrace].start;
                     _ = try astgen.addZIRNoOp(self, &gen_scope.base, src, .returnvoid);
+                }
+
+                if (self.comp.verbose_ir) {
+                    zir.dumpZir(self.gpa, "fn_body", decl.name, gen_scope.instructions.items) catch {};
                 }
 
                 const fn_zir = try gen_scope_arena.allocator.create(Fn.ZIR);
@@ -1240,6 +1269,9 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
 
                 const src = tree.token_locs[init_node.firstToken()].start;
                 const init_inst = try astgen.expr(self, &gen_scope.base, init_result_loc, init_node);
+                if (self.comp.verbose_ir) {
+                    zir.dumpZir(self.gpa, "var_init", decl.name, gen_scope.instructions.items) catch {};
+                }
 
                 var inner_block: Scope.Block = .{
                     .parent = null,
@@ -1281,6 +1313,10 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                     .val = Value.initTag(.type_type),
                 });
                 const var_type = try astgen.expr(self, &type_scope.base, .{ .ty = type_type }, type_node);
+                if (self.comp.verbose_ir) {
+                    zir.dumpZir(self.gpa, "var_type", decl.name, type_scope.instructions.items) catch {};
+                }
+
                 const ty = try zir_sema.analyzeBodyValueAsType(self, &block_scope, var_type, .{
                     .instructions = type_scope.instructions.items,
                 });
@@ -1354,6 +1390,9 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             defer gen_scope.instructions.deinit(self.gpa);
 
             _ = try astgen.comptimeExpr(self, &gen_scope.base, .none, comptime_decl.expr);
+            if (self.comp.verbose_ir) {
+                zir.dumpZir(self.gpa, "comptime_block", decl.name, gen_scope.instructions.items) catch {};
+            }
 
             var block_scope: Scope.Block = .{
                 .parent = null,
@@ -2080,6 +2119,29 @@ pub fn addCall(
     return &inst.base;
 }
 
+pub fn addSwitchBr(
+    self: *Module,
+    block: *Scope.Block,
+    src: usize,
+    target_ptr: *Inst,
+    cases: []Inst.SwitchBr.Case,
+    else_body: ir.Body,
+) !*Inst {
+    const inst = try block.arena.create(Inst.SwitchBr);
+    inst.* = .{
+        .base = .{
+            .tag = .switchbr,
+            .ty = Type.initTag(.noreturn),
+            .src = src,
+        },
+        .target_ptr = target_ptr,
+        .cases = cases,
+        .else_body = else_body,
+    };
+    try block.instructions.append(self.gpa, &inst.base);
+    return &inst.base;
+}
+
 pub fn constInst(self: *Module, scope: *Scope, src: usize, typed_value: TypedValue) !*Inst {
     const const_inst = try scope.arena().create(Inst.Constant);
     const_inst.* = .{
@@ -2400,28 +2462,43 @@ pub fn analyzeSlice(self: *Module, scope: *Scope, src: usize, array_ptr: *Inst, 
 }
 
 pub fn analyzeImport(self: *Module, scope: *Scope, src: usize, target_string: []const u8) !*Scope.File {
-    // TODO if (package_table.get(target_string)) |pkg|
-    if (self.import_table.get(target_string)) |some| {
+    const cur_pkg = scope.getOwnerPkg();
+    const cur_pkg_dir_path = cur_pkg.root_src_directory.path orelse ".";
+    const found_pkg = cur_pkg.table.get(target_string);
+
+    const resolved_path = if (found_pkg) |pkg|
+        try std.fs.path.resolve(self.gpa, &[_][]const u8{ pkg.root_src_directory.path orelse ".", pkg.root_src_path })
+    else
+        try std.fs.path.resolve(self.gpa, &[_][]const u8{ cur_pkg_dir_path, target_string });
+    errdefer self.gpa.free(resolved_path);
+
+    if (self.import_table.get(resolved_path)) |some| {
+        self.gpa.free(resolved_path);
         return some;
     }
 
-    // TODO check for imports outside of pkg path
-    if (false) return error.ImportOutsidePkgPath;
+    if (found_pkg == null) {
+        const resolved_root_path = try std.fs.path.resolve(self.gpa, &[_][]const u8{cur_pkg_dir_path});
+        defer self.gpa.free(resolved_root_path);
+
+        if (!mem.startsWith(u8, resolved_path, resolved_root_path)) {
+            return error.ImportOutsidePkgPath;
+        }
+    }
 
     // TODO Scope.Container arena for ty and sub_file_path
     const struct_payload = try self.gpa.create(Type.Payload.EmptyStruct);
     errdefer self.gpa.destroy(struct_payload);
     const file_scope = try self.gpa.create(Scope.File);
     errdefer self.gpa.destroy(file_scope);
-    const file_path = try self.gpa.dupe(u8, target_string);
-    errdefer self.gpa.free(file_path);
 
     struct_payload.* = .{ .scope = &file_scope.root_container };
     file_scope.* = .{
-        .sub_file_path = file_path,
+        .sub_file_path = resolved_path,
         .source = .{ .unloaded = {} },
         .contents = .{ .not_available = {} },
         .status = .never_loaded,
+        .pkg = found_pkg orelse cur_pkg,
         .root_container = .{
             .file_scope = file_scope,
             .decls = .{},
@@ -2559,7 +2636,7 @@ pub fn cmpNumeric(
         dest_float_type = lhs.ty;
     } else {
         const int_info = lhs.ty.intInfo(self.getTarget());
-        lhs_bits = int_info.bits + @boolToInt(!int_info.signed and dest_int_is_signed);
+        lhs_bits = int_info.bits + @boolToInt(int_info.signedness == .unsigned and dest_int_is_signed);
     }
 
     var rhs_bits: usize = undefined;
@@ -2594,7 +2671,7 @@ pub fn cmpNumeric(
         dest_float_type = rhs.ty;
     } else {
         const int_info = rhs.ty.intInfo(self.getTarget());
-        rhs_bits = int_info.bits + @boolToInt(!int_info.signed and dest_int_is_signed);
+        rhs_bits = int_info.bits + @boolToInt(int_info.signedness == .unsigned and dest_int_is_signed);
     }
 
     const dest_type = if (dest_float_type) |ft| ft else blk: {
@@ -2743,9 +2820,9 @@ pub fn coerce(self: *Module, scope: *Scope, dest_type: Type, inst: *Inst) !*Inst
 
         const src_info = inst.ty.intInfo(self.getTarget());
         const dst_info = dest_type.intInfo(self.getTarget());
-        if ((src_info.signed == dst_info.signed and dst_info.bits >= src_info.bits) or
+        if ((src_info.signedness == dst_info.signedness and dst_info.bits >= src_info.bits) or
             // small enough unsigned ints can get casted to large enough signed ints
-            (src_info.signed and !dst_info.signed and dst_info.bits > src_info.bits))
+            (src_info.signedness == .signed and dst_info.signedness == .unsigned and dst_info.bits > src_info.bits))
         {
             const b = try self.requireRuntimeBlock(scope, inst.src);
             return self.addUnOp(b, inst.src, dest_type, .intcast, inst);

@@ -119,13 +119,7 @@ pub const msghdr_const = extern struct {
 pub const off_t = i64;
 pub const ino_t = u64;
 
-/// Renamed to Stat to not conflict with the stat function.
-/// atime, mtime, and ctime have functions to return `timespec`,
-/// because although this is a POSIX API, the layout and names of
-/// the structs are inconsistent across operating systems, and
-/// in C, macros are used to hide the differences. Here we use
-/// methods to accomplish this.
-pub const Stat = extern struct {
+pub const libc_stat = extern struct {
     dev: u64,
     ino: ino_t,
     nlink: usize,
@@ -149,15 +143,15 @@ pub const Stat = extern struct {
     gen: u64,
     __spare: [10]u64,
 
-    pub fn atime(self: Stat) timespec {
+    pub fn atime(self: @This()) timespec {
         return self.atim;
     }
 
-    pub fn mtime(self: Stat) timespec {
+    pub fn mtime(self: @This()) timespec {
         return self.mtim;
     }
 
-    pub fn ctime(self: Stat) timespec {
+    pub fn ctime(self: @This()) timespec {
         return self.ctim;
     }
 };
@@ -742,23 +736,61 @@ pub const winsize = extern struct {
 
 const NSIG = 32;
 
-pub const SIG_ERR = @intToPtr(fn (i32) callconv(.C) void, maxInt(usize));
-pub const SIG_DFL = @intToPtr(fn (i32) callconv(.C) void, 0);
-pub const SIG_IGN = @intToPtr(fn (i32) callconv(.C) void, 1);
+pub const SIG_ERR = @intToPtr(?Sigaction.sigaction_fn, maxInt(usize));
+pub const SIG_DFL = @intToPtr(?Sigaction.sigaction_fn, 0);
+pub const SIG_IGN = @intToPtr(?Sigaction.sigaction_fn, 1);
 
 /// Renamed from `sigaction` to `Sigaction` to avoid conflict with the syscall.
 pub const Sigaction = extern struct {
+    pub const handler_fn = fn (c_int) callconv(.C) void;
+    pub const sigaction_fn = fn (c_int, *const siginfo_t, ?*const c_void) callconv(.C) void;
+
     /// signal handler
-    __sigaction_u: extern union {
-        __sa_handler: fn (i32) callconv(.C) void,
-        __sa_sigaction: fn (i32, *__siginfo, usize) callconv(.C) void,
+    handler: extern union {
+        handler: ?handler_fn,
+        sigaction: ?sigaction_fn,
     },
 
     /// see signal options
-    sa_flags: u32,
+    flags: c_uint,
 
     /// signal mask to apply
-    sa_mask: sigset_t,
+    mask: sigset_t,
+};
+
+pub const siginfo_t = extern struct {
+    signo: c_int,
+    errno: c_int,
+    code: c_int,
+    pid: pid_t,
+    uid: uid_t,
+    status: c_int,
+    addr: ?*c_void,
+    value: sigval,
+    reason: extern union {
+        fault: extern struct {
+            trapno: c_int,
+        },
+        timer: extern struct {
+            timerid: c_int,
+            overrun: c_int,
+        },
+        mesgq: extern struct {
+            mqd: c_int,
+        },
+        poll: extern struct {
+            band: c_long,
+        },
+        spare: extern struct {
+            spare1: c_long,
+            spare2: [7]c_int,
+        },
+    },
+};
+
+pub const sigval = extern union {
+    int: c_int,
+    ptr: ?*c_void,
 };
 
 pub const _SIG_WORDS = 4;
@@ -780,6 +812,8 @@ pub inline fn _SIG_VALID(sig: usize) usize {
 pub const sigset_t = extern struct {
     __bits: [_SIG_WORDS]u32,
 };
+
+pub const empty_sigset = sigset_t{ .__bits = [_]u32{0} ** _SIG_WORDS };
 
 pub const EPERM = 1; // Operation not permitted
 pub const ENOENT = 2; // No such file or directory
@@ -1358,3 +1392,43 @@ pub const IPPROTO_RESERVED_253 = 253;
 
 /// Reserved
 pub const IPPROTO_RESERVED_254 = 254;
+
+pub const rlimit_resource = extern enum(c_int) {
+    CPU = 0,
+    FSIZE = 1,
+    DATA = 2,
+    STACK = 3,
+    CORE = 4,
+    RSS = 5,
+    MEMLOCK = 6,
+    NPROC = 7,
+    NOFILE = 8,
+    SBSIZE = 9,
+    VMEM = 10,
+    AS = 10,
+    NPTS = 11,
+    SWAP = 12,
+    KQUEUES = 13,
+    UMTXP = 14,
+
+    _,
+};
+
+pub const rlim_t = i64;
+
+/// No limit
+pub const RLIM_INFINITY: rlim_t = (1 << 63) - 1;
+
+pub const RLIM_SAVED_MAX = RLIM_INFINITY;
+pub const RLIM_SAVED_CUR = RLIM_INFINITY;
+
+pub const rlimit = extern struct {
+    /// Soft limit
+    cur: rlim_t,
+    /// Hard limit
+    max: rlim_t,
+};
+
+pub const SHUT_RD = 0;
+pub const SHUT_WR = 1;
+pub const SHUT_RDWR = 2;

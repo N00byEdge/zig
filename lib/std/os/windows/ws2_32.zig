@@ -116,7 +116,7 @@ pub const WSAOVERLAPPED_COMPLETION_ROUTINE = fn (dwError: DWORD, cbTransferred: 
 pub const ADDRESS_FAMILY = u16;
 
 // Microsoft use the signed c_int for this, but it should never be negative
-const socklen_t = u32;
+pub const socklen_t = u32;
 
 pub const AF_UNSPEC = 0;
 pub const AF_UNIX = 1;
@@ -233,6 +233,27 @@ pub const WSAMSG = extern struct {
     Control: WSABUF,
     dwFlags: DWORD,
 };
+
+pub const pollfd = extern struct {
+    fd: SOCKET,
+    events: SHORT,
+    revents: SHORT,
+};
+
+// Event flag definitions for WSAPoll().
+
+pub const POLLRDNORM = 0x0100;
+pub const POLLRDBAND = 0x0200;
+pub const POLLIN = (POLLRDNORM | POLLRDBAND);
+pub const POLLPRI = 0x0400;
+
+pub const POLLWRNORM = 0x0010;
+pub const POLLOUT = (POLLWRNORM);
+pub const POLLWRBAND = 0x0020;
+
+pub const POLLERR = 0x0001;
+pub const POLLHUP = 0x0002;
+pub const POLLNVAL = 0x0004;
 
 // https://docs.microsoft.com/en-au/windows/win32/winsock/windows-sockets-error-codes-2
 pub const WinsockError = extern enum(u16) {
@@ -697,12 +718,47 @@ const IOC_WS2 = 0x08000000;
 
 pub const SIO_BASE_HANDLE = IOC_OUT | IOC_WS2 | 34;
 
+pub const SOL_SOCKET = 0xffff;
+
+pub const SO_DEBUG = 0x0001;
+pub const SO_ACCEPTCONN = 0x0002;
+pub const SO_REUSEADDR = 0x0004;
+pub const SO_KEEPALIVE = 0x0008;
+pub const SO_DONTROUTE = 0x0010;
+pub const SO_BROADCAST = 0x0020;
+pub const SO_USELOOPBACK = 0x0040;
+pub const SO_LINGER = 0x0080;
+pub const SO_OOBINLINE = 0x0100;
+
+pub const SO_DONTLINGER = ~@as(u32, SO_LINGER);
+pub const SO_EXCLUSIVEADDRUSE = ~@as(u32, SO_REUSEADDR);
+
+pub const SO_SNDBUF = 0x1001;
+pub const SO_RCVBUF = 0x1002;
+pub const SO_SNDLOWAT = 0x1003;
+pub const SO_RCVLOWAT = 0x1004;
+pub const SO_SNDTIMEO = 0x1005;
+pub const SO_RCVTIMEO = 0x1006;
+pub const SO_ERROR = 0x1007;
+pub const SO_TYPE = 0x1008;
+
+pub const SO_GROUP_ID = 0x2001;
+pub const SO_GROUP_PRIORITY = 0x2002;
+pub const SO_MAX_MSG_SIZE = 0x2003;
+pub const SO_PROTOCOL_INFOA = 0x2004;
+pub const SO_PROTOCOL_INFOW = 0x2005;
+
+pub const PVD_CONFIG = 0x3001;
+pub const SO_CONDITIONAL_ACCEPT = 0x3002;
+
+pub const TCP_NODELAY = 0x0001;
+
 pub extern "ws2_32" fn WSAStartup(
     wVersionRequired: WORD,
     lpWSAData: *WSADATA,
-) callconv(.Stdcall) c_int;
-pub extern "ws2_32" fn WSACleanup() callconv(.Stdcall) c_int;
-pub extern "ws2_32" fn WSAGetLastError() callconv(.Stdcall) WinsockError;
+) callconv(WINAPI) c_int;
+pub extern "ws2_32" fn WSACleanup() callconv(WINAPI) c_int;
+pub extern "ws2_32" fn WSAGetLastError() callconv(WINAPI) WinsockError;
 pub extern "ws2_32" fn WSASocketA(
     af: c_int,
     type: c_int,
@@ -710,7 +766,7 @@ pub extern "ws2_32" fn WSASocketA(
     lpProtocolInfo: ?*WSAPROTOCOL_INFOA,
     g: GROUP,
     dwFlags: DWORD,
-) callconv(.Stdcall) SOCKET;
+) callconv(WINAPI) SOCKET;
 pub extern "ws2_32" fn WSASocketW(
     af: c_int,
     type: c_int,
@@ -718,8 +774,8 @@ pub extern "ws2_32" fn WSASocketW(
     lpProtocolInfo: ?*WSAPROTOCOL_INFOW,
     g: GROUP,
     dwFlags: DWORD,
-) callconv(.Stdcall) SOCKET;
-pub extern "ws2_32" fn closesocket(s: SOCKET) callconv(.Stdcall) c_int;
+) callconv(WINAPI) SOCKET;
+pub extern "ws2_32" fn closesocket(s: SOCKET) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn WSAIoctl(
     s: SOCKET,
     dwIoControlCode: DWORD,
@@ -730,17 +786,26 @@ pub extern "ws2_32" fn WSAIoctl(
     lpcbBytesReturned: LPDWORD,
     lpOverlapped: ?*WSAOVERLAPPED,
     lpCompletionRoutine: ?WSAOVERLAPPED_COMPLETION_ROUTINE,
-) callconv(.Stdcall) c_int;
+) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn accept(
     s: SOCKET,
     addr: ?*sockaddr,
-    addrlen: socklen_t,
-) callconv(.Stdcall) SOCKET;
+    addrlen: ?*c_int,
+) callconv(WINAPI) SOCKET;
+pub extern "ws2_32" fn bind(
+    s: SOCKET,
+    addr: ?*const sockaddr,
+    addrlen: c_int,
+) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn connect(
     s: SOCKET,
     name: *const sockaddr,
-    namelen: socklen_t,
-) callconv(.Stdcall) c_int;
+    namelen: c_int,
+) callconv(WINAPI) c_int;
+pub extern "ws2_32" fn listen(
+    s: SOCKET,
+    backlog: c_int,
+) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn WSARecv(
     s: SOCKET,
     lpBuffers: [*]const WSABUF,
@@ -749,7 +814,7 @@ pub extern "ws2_32" fn WSARecv(
     lpFlags: *DWORD,
     lpOverlapped: ?*WSAOVERLAPPED,
     lpCompletionRoutine: ?WSAOVERLAPPED_COMPLETION_ROUTINE,
-) callconv(.Stdcall) c_int;
+) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn WSARecvFrom(
     s: SOCKET,
     lpBuffers: [*]const WSABUF,
@@ -760,7 +825,7 @@ pub extern "ws2_32" fn WSARecvFrom(
     lpFromlen: ?*socklen_t,
     lpOverlapped: ?*WSAOVERLAPPED,
     lpCompletionRoutine: ?WSAOVERLAPPED_COMPLETION_ROUTINE,
-) callconv(.Stdcall) c_int;
+) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn WSASend(
     s: SOCKET,
     lpBuffers: [*]WSABUF,
@@ -769,7 +834,7 @@ pub extern "ws2_32" fn WSASend(
     dwFlags: DWORD,
     lpOverlapped: ?*WSAOVERLAPPED,
     lpCompletionRoutine: ?WSAOVERLAPPED_COMPLETION_ROUTINE,
-) callconv(.Stdcall) c_int;
+) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn WSASendTo(
     s: SOCKET,
     lpBuffers: [*]WSABUF,
@@ -777,21 +842,42 @@ pub extern "ws2_32" fn WSASendTo(
     lpNumberOfBytesSent: ?*DWORD,
     dwFlags: DWORD,
     lpTo: ?*const sockaddr,
-    iTolen: socklen_t,
+    iTolen: c_int,
     lpOverlapped: ?*WSAOVERLAPPED,
     lpCompletionRoutine: ?WSAOVERLAPPED_COMPLETION_ROUTINE,
-) callconv(.Stdcall) c_int;
+) callconv(WINAPI) c_int;
+pub extern "ws2_32" fn WSAPoll(
+    fdArray: [*]pollfd,
+    fds: c_ulong,
+    timeout: c_int,
+) callconv(WINAPI) c_int;
 pub extern "ws2_32" fn getaddrinfo(
     pNodeName: [*:0]const u8,
     pServiceName: [*:0]const u8,
     pHints: *const addrinfo,
     ppResult: **addrinfo,
-) callconv(.Stdcall) i32;
+) callconv(WINAPI) i32;
 pub extern "ws2_32" fn freeaddrinfo(
     pAddrInfo: *addrinfo,
-) callconv(.Stdcall) void;
+) callconv(WINAPI) void;
 pub extern "ws2_32" fn ioctlsocket(
     s: SOCKET,
     cmd: c_long,
     argp: *c_ulong,
-) callconv(.Stdcall) c_int;
+) callconv(WINAPI) c_int;
+pub extern "ws2_32" fn getsockname(
+    s: SOCKET,
+    name: *sockaddr,
+    namelen: *c_int,
+) callconv(WINAPI) c_int;
+pub extern "ws2_32" fn setsockopt(
+    s: SOCKET,
+    level: u32,
+    optname: u32,
+    optval: ?*const c_void,
+    optlen: socklen_t,
+) callconv(WINAPI) c_int;
+pub extern "ws2_32" fn shutdown(
+    s: SOCKET,
+    how: c_int,
+) callconv(WINAPI) c_int;

@@ -95,7 +95,7 @@ fn exp2_32(x: f32) f32 {
     uf -= redux;
 
     const z: f64 = x - uf;
-    var r: f64 = exp2ft[i_0];
+    var r: f64 = exp2ft[@intCast(usize, i_0)];
     const t: f64 = r * z;
     r = r + t * (P1 + z * P2) + t * (z * z) * (P3 + z * P4);
     return @floatCast(f32, r * uk);
@@ -418,8 +418,8 @@ fn exp2_64(x: f64) f64 {
 
     // r = exp2(y) = exp2t[i_0] * p(z - eps[i])
     var z = x - uf;
-    const t = exp2dt[2 * i_0];
-    z -= exp2dt[2 * i_0 + 1];
+    const t = exp2dt[@intCast(usize, 2 * i_0)];
+    z -= exp2dt[@intCast(usize, 2 * i_0 + 1)];
     const r = t + t * z * (P1 + z * (P2 + z * (P3 + z * (P4 + z * P5))));
 
     return math.scalbn(r, ik);
@@ -434,19 +434,19 @@ test "math.exp2_32" {
     const epsilon = 0.000001;
 
     expect(exp2_32(0.0) == 1.0);
-    expect(math.approxEq(f32, exp2_32(0.2), 1.148698, epsilon));
-    expect(math.approxEq(f32, exp2_32(0.8923), 1.856133, epsilon));
-    expect(math.approxEq(f32, exp2_32(1.5), 2.828427, epsilon));
-    expect(math.approxEq(f32, exp2_32(37.45), 187747237888, epsilon));
+    expect(math.approxEqAbs(f32, exp2_32(0.2), 1.148698, epsilon));
+    expect(math.approxEqAbs(f32, exp2_32(0.8923), 1.856133, epsilon));
+    expect(math.approxEqAbs(f32, exp2_32(1.5), 2.828427, epsilon));
+    expect(math.approxEqAbs(f32, exp2_32(37.45), 187747237888, epsilon));
 }
 
 test "math.exp2_64" {
     const epsilon = 0.000001;
 
     expect(exp2_64(0.0) == 1.0);
-    expect(math.approxEq(f64, exp2_64(0.2), 1.148698, epsilon));
-    expect(math.approxEq(f64, exp2_64(0.8923), 1.856133, epsilon));
-    expect(math.approxEq(f64, exp2_64(1.5), 2.828427, epsilon));
+    expect(math.approxEqAbs(f64, exp2_64(0.2), 1.148698, epsilon));
+    expect(math.approxEqAbs(f64, exp2_64(0.8923), 1.856133, epsilon));
+    expect(math.approxEqAbs(f64, exp2_64(1.5), 2.828427, epsilon));
 }
 
 test "math.exp2_32.special" {

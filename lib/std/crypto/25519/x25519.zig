@@ -4,8 +4,11 @@
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
 const std = @import("std");
+const crypto = std.crypto;
 const mem = std.mem;
 const fmt = std.fmt;
+
+const Sha512 = crypto.hash.sha2.Sha512;
 
 /// X25519 DH function.
 pub const X25519 = struct {
@@ -13,50 +16,78 @@ pub const X25519 = struct {
     pub const Curve = @import("curve25519.zig").Curve25519;
     /// Length (in bytes) of a secret key.
     pub const secret_length = 32;
+    /// Length (in bytes) of a public key.
+    pub const public_length = 32;
     /// Length (in bytes) of the output of the DH function.
-    pub const key_length = 32;
+    pub const shared_length = 32;
+    /// Seed (for key pair creation) length in bytes.
+    pub const seed_length = 32;
+
+    /// An X25519 key pair.
+    pub const KeyPair = struct {
+        /// Public part.
+        public_key: [public_length]u8,
+        /// Secret part.
+        secret_key: [secret_length]u8,
+
+        /// Create a new key pair using an optional seed.
+        pub fn create(seed: ?[seed_length]u8) !KeyPair {
+            const sk = seed orelse sk: {
+                var random_seed: [seed_length]u8 = undefined;
+                try crypto.randomBytes(&random_seed);
+                break :sk random_seed;
+            };
+            var kp: KeyPair = undefined;
+            mem.copy(u8, &kp.secret_key, sk[0..]);
+            kp.public_key = try X25519.recoverPublicKey(sk);
+            return kp;
+        }
+
+        /// Create a key pair from an Ed25519 key pair
+        pub fn fromEd25519(ed25519_key_pair: crypto.sign.Ed25519.KeyPair) !KeyPair {
+            const seed = ed25519_key_pair.secret_key[0..32];
+            var az: [Sha512.digest_length]u8 = undefined;
+            Sha512.hash(seed, &az, .{});
+            var sk = az[0..32].*;
+            Curve.scalar.clamp(&sk);
+            const pk = try publicKeyFromEd25519(ed25519_key_pair.public_key);
+            return KeyPair{
+                .public_key = pk,
+                .secret_key = sk,
+            };
+        }
+    };
 
     /// Compute the public key for a given private key.
-    pub fn createPublicKey(public_key: []u8, private_key: []const u8) bool {
-        std.debug.assert(private_key.len >= key_length);
-        std.debug.assert(public_key.len >= key_length);
-        var s: [32]u8 = undefined;
-        mem.copy(u8, &s, private_key[0..32]);
-        if (Curve.basePoint.clampedMul(s)) |q| {
-            mem.copy(u8, public_key, q.toBytes()[0..]);
-            return true;
-        } else |_| {
-            return false;
-        }
+    pub fn recoverPublicKey(secret_key: [secret_length]u8) ![public_length]u8 {
+        const q = try Curve.basePoint.clampedMul(secret_key);
+        return q.toBytes();
+    }
+
+    /// Compute the X25519 equivalent to an Ed25519 public eky.
+    pub fn publicKeyFromEd25519(ed25519_public_key: [crypto.sign.Ed25519.public_length]u8) ![public_length]u8 {
+        const pk_ed = try crypto.ecc.Edwards25519.fromBytes(ed25519_public_key);
+        const pk = try Curve.fromEdwards25519(pk_ed);
+        return pk.toBytes();
     }
 
     /// Compute the scalar product of a public key and a secret scalar.
     /// Note that the output should not be used as a shared secret without
     /// hashing it first.
-    pub fn create(out: []u8, private_key: []const u8, public_key: []const u8) bool {
-        std.debug.assert(out.len >= secret_length);
-        std.debug.assert(private_key.len >= key_length);
-        std.debug.assert(public_key.len >= key_length);
-        var s: [32]u8 = undefined;
-        var b: [32]u8 = undefined;
-        mem.copy(u8, &s, private_key[0..32]);
-        mem.copy(u8, &b, public_key[0..32]);
-        if (Curve.fromBytes(b).clampedMul(s)) |q| {
-            mem.copy(u8, out, q.toBytes()[0..]);
-            return true;
-        } else |_| {
-            return false;
-        }
+    pub fn scalarmult(secret_key: [secret_length]u8, public_key: [public_length]u8) ![shared_length]u8 {
+        const q = try Curve.fromBytes(public_key).clampedMul(secret_key);
+        return q.toBytes();
     }
 };
+
+const htest = @import("../test.zig");
 
 test "x25519 public key calculation from secret key" {
     var sk: [32]u8 = undefined;
     var pk_expected: [32]u8 = undefined;
-    var pk_calculated: [32]u8 = undefined;
     try fmt.hexToBytes(sk[0..], "8052030376d47112be7f73ed7a019293dd12ad910b654455798b4667d73de166");
     try fmt.hexToBytes(pk_expected[0..], "f1814f0e8ff1043d8a44d25babff3cedcae6c22c3edaa48f857ae70de2baae50");
-    std.testing.expect(X25519.createPublicKey(pk_calculated[0..], &sk));
+    const pk_calculated = try X25519.recoverPublicKey(sk);
     std.testing.expectEqual(pk_calculated, pk_expected);
 }
 
@@ -66,9 +97,7 @@ test "x25519 rfc7748 vector1" {
 
     const expected_output = [32]u8{ 0xc3, 0xda, 0x55, 0x37, 0x9d, 0xe9, 0xc6, 0x90, 0x8e, 0x94, 0xea, 0x4d, 0xf2, 0x8d, 0x08, 0x4f, 0x32, 0xec, 0xcf, 0x03, 0x49, 0x1c, 0x71, 0xf7, 0x54, 0xb4, 0x07, 0x55, 0x77, 0xa2, 0x85, 0x52 };
 
-    var output: [32]u8 = undefined;
-
-    std.testing.expect(X25519.create(output[0..], secret_key[0..], public_key[0..]));
+    const output = try X25519.scalarmult(secret_key, public_key);
     std.testing.expectEqual(output, expected_output);
 }
 
@@ -78,9 +107,7 @@ test "x25519 rfc7748 vector2" {
 
     const expected_output = [32]u8{ 0x95, 0xcb, 0xde, 0x94, 0x76, 0xe8, 0x90, 0x7d, 0x7a, 0xad, 0xe4, 0x5c, 0xb4, 0xb8, 0x73, 0xf8, 0x8b, 0x59, 0x5a, 0x68, 0x79, 0x9f, 0xa1, 0x52, 0xe6, 0xf8, 0xf7, 0x64, 0x7a, 0xac, 0x79, 0x57 };
 
-    var output: [32]u8 = undefined;
-
-    std.testing.expect(X25519.create(output[0..], secret_key[0..], public_key[0..]));
+    const output = try X25519.scalarmult(secret_key, public_key);
     std.testing.expectEqual(output, expected_output);
 }
 
@@ -93,9 +120,7 @@ test "x25519 rfc7748 one iteration" {
 
     var i: usize = 0;
     while (i < 1) : (i += 1) {
-        var output: [32]u8 = undefined;
-        std.testing.expect(X25519.create(output[0..], &k, &u));
-
+        const output = try X25519.scalarmult(k, u);
         mem.copy(u8, u[0..], k[0..]);
         mem.copy(u8, k[0..], output[0..]);
     }
@@ -117,9 +142,7 @@ test "x25519 rfc7748 1,000 iterations" {
 
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        var output: [32]u8 = undefined;
-        std.testing.expect(X25519.create(output[0..], &k, &u));
-
+        const output = try X25519.scalarmult(&k, &u);
         mem.copy(u8, u[0..], k[0..]);
         mem.copy(u8, k[0..], output[0..]);
     }
@@ -140,12 +163,17 @@ test "x25519 rfc7748 1,000,000 iterations" {
 
     var i: usize = 0;
     while (i < 1000000) : (i += 1) {
-        var output: [32]u8 = undefined;
-        std.testing.expect(X25519.create(output[0..], &k, &u));
-
+        const output = try X25519.scalarmult(&k, &u);
         mem.copy(u8, u[0..], k[0..]);
         mem.copy(u8, k[0..], output[0..]);
     }
 
     std.testing.expectEqual(k[0..], expected_output);
+}
+
+test "edwards25519 -> curve25519 map" {
+    const ed_kp = try crypto.sign.Ed25519.KeyPair.create([_]u8{0x42} ** 32);
+    const mont_kp = try X25519.KeyPair.fromEd25519(ed_kp);
+    htest.assertEqual("90e7595fc89e52fdfddce9c6a43d74dbf6047025ee0462d2d172e8b6a2841d6e", &mont_kp.secret_key);
+    htest.assertEqual("cc4f2cdb695dd766f34118eb67b98652fed1d8bc49c330b119bbfa8a64989378", &mont_kp.public_key);
 }

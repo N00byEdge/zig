@@ -466,6 +466,8 @@ pub const Loop = struct {
                         .revents = undefined,
                     }};
                     _ = os.poll(&pfd, -1) catch |poll_err| switch (poll_err) {
+                        error.NetworkSubsystemFailed => unreachable, // only possible on windows
+
                         error.SystemResources,
                         error.Unexpected,
                         => {
@@ -772,7 +774,7 @@ pub const Loop = struct {
             self.delay_queue.waiters.insert(&entry);
 
             // Speculatively wake up the timer thread when we add a new entry.
-            // If the timer thread is sleeping on a longer entry, we need to 
+            // If the timer thread is sleeping on a longer entry, we need to
             // interrupt it so that our entry can be expired in time.
             self.delay_queue.event.set();
         }
@@ -784,7 +786,7 @@ pub const Loop = struct {
         thread: *std.Thread,
         event: std.AutoResetEvent,
         is_running: bool,
-        
+
         /// Initialize the delay queue by spawning the timer thread
         /// and starting any timer resources.
         fn init(self: *DelayQueue) !void {
@@ -799,7 +801,7 @@ pub const Loop = struct {
             };
         }
 
-        /// Entry point for the timer thread 
+        /// Entry point for the timer thread
         /// which waits for timer entries to expire and reschedules them.
         fn run(self: *DelayQueue) void {
             const loop = @fieldParentPtr(Loop, "delay_queue", self);
@@ -847,12 +849,12 @@ pub const Loop = struct {
                 const entry = self.peekExpiringEntry() orelse return null;
                 if (entry.expires > now)
                     return null;
-                
+
                 assert(self.entries.remove(&entry.node));
                 return entry;
             }
-            
-            /// Returns an estimate for the amount of time 
+
+            /// Returns an estimate for the amount of time
             /// to wait until the next waiting entry expires.
             fn nextExpire(self: *Waiters) ?u64 {
                 const entry = self.peekExpiringEntry() orelse return null;
@@ -1272,6 +1274,7 @@ pub const Loop = struct {
     }
 
     pub fn recvfrom(
+        self: *Loop,
         sockfd: os.fd_t,
         buf: []u8,
         flags: u32,

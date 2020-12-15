@@ -172,7 +172,7 @@ pub const AT_REMOVEDIR = 0x200;
 
 pub const in_port_t = u16;
 pub const sa_family_t = ws2_32.ADDRESS_FAMILY;
-pub const socklen_t = u32;
+pub const socklen_t = ws2_32.socklen_t;
 
 pub const sockaddr = ws2_32.sockaddr;
 pub const sockaddr_in = ws2_32.sockaddr_in;
@@ -242,6 +242,54 @@ pub const IPPROTO_TCP = ws2_32.IPPROTO_TCP;
 pub const IPPROTO_UDP = ws2_32.IPPROTO_UDP;
 pub const IPPROTO_ICMPV6 = ws2_32.IPPROTO_ICMPV6;
 pub const IPPROTO_RM = ws2_32.IPPROTO_RM;
+
+pub const pollfd = ws2_32.pollfd;
+
+pub const POLLRDNORM = ws2_32.POLLRDNORM;
+pub const POLLRDBAND = ws2_32.POLLRDBAND;
+pub const POLLIN = ws2_32.POLLIN;
+pub const POLLPRI = ws2_32.POLLPRI;
+pub const POLLWRNORM = ws2_32.POLLWRNORM;
+pub const POLLOUT = ws2_32.POLLOUT;
+pub const POLLWRBAND = ws2_32.POLLWRBAND;
+pub const POLLERR = ws2_32.POLLERR;
+pub const POLLHUP = ws2_32.POLLHUP;
+pub const POLLNVAL = ws2_32.POLLNVAL;
+
+pub const SOL_SOCKET = ws2_32.SOL_SOCKET;
+
+pub const SO_DEBUG = ws2_32.SO_DEBUG;
+pub const SO_ACCEPTCONN = ws2_32.SO_ACCEPTCONN;
+pub const SO_REUSEADDR = ws2_32.SO_REUSEADDR;
+pub const SO_KEEPALIVE = ws2_32.SO_KEEPALIVE;
+pub const SO_DONTROUTE = ws2_32.SO_DONTROUTE;
+pub const SO_BROADCAST = ws2_32.SO_BROADCAST;
+pub const SO_USELOOPBACK = ws2_32.SO_USELOOPBACK;
+pub const SO_LINGER = ws2_32.SO_LINGER;
+pub const SO_OOBINLINE = ws2_32.SO_OOBINLINE;
+
+pub const SO_DONTLINGER = ws2_32.SO_DONTLINGER;
+pub const SO_EXCLUSIVEADDRUSE = ws2_32.SO_EXCLUSIVEADDRUSE;
+
+pub const SO_SNDBUF = ws2_32.SO_SNDBUF;
+pub const SO_RCVBUF = ws2_32.SO_RCVBUF;
+pub const SO_SNDLOWAT = ws2_32.SO_SNDLOWAT;
+pub const SO_RCVLOWAT = ws2_32.SO_RCVLOWAT;
+pub const SO_SNDTIMEO = ws2_32.SO_SNDTIMEO;
+pub const SO_RCVTIMEO = ws2_32.SO_RCVTIMEO;
+pub const SO_ERROR = ws2_32.SO_ERROR;
+pub const SO_TYPE = ws2_32.SO_TYPE;
+
+pub const SO_GROUP_ID = ws2_32.SO_GROUP_ID;
+pub const SO_GROUP_PRIORITY = ws2_32.SO_GROUP_PRIORITY;
+pub const SO_MAX_MSG_SIZE = ws2_32.SO_MAX_MSG_SIZE;
+pub const SO_PROTOCOL_INFOA = ws2_32.SO_PROTOCOL_INFOA;
+pub const SO_PROTOCOL_INFOW = ws2_32.SO_PROTOCOL_INFOW;
+
+pub const PVD_CONFIG = ws2_32.PVD_CONFIG;
+pub const SO_CONDITIONAL_ACCEPT = ws2_32.SO_CONDITIONAL_ACCEPT;
+
+pub const TCP_NODELAY = ws2_32.TCP_NODELAY;
 
 pub const O_RDONLY = 0o0;
 pub const O_WRONLY = 0o1;

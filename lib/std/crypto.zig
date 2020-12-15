@@ -6,15 +6,28 @@
 
 /// Authenticated Encryption with Associated Data
 pub const aead = struct {
-    const chacha20 = @import("crypto/chacha20.zig");
+    pub const aegis = struct {
+        pub const Aegis128L = @import("crypto/aegis.zig").Aegis128L;
+        pub const Aegis256 = @import("crypto/aegis.zig").Aegis256;
+    };
+
+    pub const aes_gcm = struct {
+        pub const Aes128Gcm = @import("crypto/aes_gcm.zig").Aes128Gcm;
+        pub const Aes256Gcm = @import("crypto/aes_gcm.zig").Aes256Gcm;
+    };
 
     pub const Gimli = @import("crypto/gimli.zig").Aead;
-    pub const ChaCha20Poly1305 = chacha20.Chacha20Poly1305;
-    pub const XChaCha20Poly1305 = chacha20.XChacha20Poly1305;
-    pub const Aegis128L = @import("crypto/aegis.zig").Aegis128L;
-    pub const Aegis256 = @import("crypto/aegis.zig").Aegis256;
-    pub const Aes128Gcm = @import("crypto/aes_gcm.zig").Aes128Gcm;
-    pub const Aes256Gcm = @import("crypto/aes_gcm.zig").Aes256Gcm;
+
+    pub const chacha_poly = struct {
+        pub const ChaCha20Poly1305 = @import("crypto/chacha20.zig").Chacha20Poly1305;
+        pub const XChaCha20Poly1305 = @import("crypto/chacha20.zig").XChacha20Poly1305;
+    };
+
+    pub const isap = @import("crypto/isap.zig");
+
+    pub const salsa_poly = struct {
+        pub const XSalsa20Poly1305 = @import("crypto/salsa20.zig").XSalsa20Poly1305;
+    };
 };
 
 /// Authentication (MAC) functions.
@@ -50,13 +63,13 @@ pub const ecc = struct {
 
 /// Hash functions.
 pub const hash = struct {
+    pub const blake2 = @import("crypto/blake2.zig");
+    pub const Blake3 = @import("crypto/blake3.zig").Blake3;
+    pub const Gimli = @import("crypto/gimli.zig").Hash;
     pub const Md5 = @import("crypto/md5.zig").Md5;
     pub const Sha1 = @import("crypto/sha1.zig").Sha1;
     pub const sha2 = @import("crypto/sha2.zig");
     pub const sha3 = @import("crypto/sha3.zig");
-    pub const blake2 = @import("crypto/blake2.zig");
-    pub const Blake3 = @import("crypto/blake3.zig").Blake3;
-    pub const Gimli = @import("crypto/gimli.zig").Hash;
 };
 
 /// Key derivation functions.
@@ -66,8 +79,8 @@ pub const kdf = struct {
 
 /// MAC functions requiring single-use secret keys.
 pub const onetimeauth = struct {
-    pub const Poly1305 = @import("crypto/poly1305.zig").Poly1305;
     pub const Ghash = @import("crypto/ghash.zig").Ghash;
+    pub const Poly1305 = @import("crypto/poly1305.zig").Poly1305;
 };
 
 /// A password hashing function derives a uniform key from low-entropy input material such as passwords.
@@ -87,6 +100,7 @@ pub const onetimeauth = struct {
 ///
 /// Password hashing functions must be used whenever sensitive data has to be directly derived from a password.
 pub const pwhash = struct {
+    pub const bcrypt = @import("crypto/bcrypt.zig");
     pub const pbkdf2 = @import("crypto/pbkdf2.zig").pbkdf2;
 };
 
@@ -98,10 +112,27 @@ pub const sign = struct {
 /// Stream ciphers. These do not provide any kind of authentication.
 /// Most applications should be using AEAD constructions instead of stream ciphers directly.
 pub const stream = struct {
-    pub const ChaCha20IETF = @import("crypto/chacha20.zig").ChaCha20IETF;
-    pub const XChaCha20IETF = @import("crypto/chacha20.zig").XChaCha20IETF;
-    pub const ChaCha20With64BitNonce = @import("crypto/chacha20.zig").ChaCha20With64BitNonce;
+    pub const chacha = struct {
+        pub const ChaCha20IETF = @import("crypto/chacha20.zig").ChaCha20IETF;
+        pub const ChaCha20With64BitNonce = @import("crypto/chacha20.zig").ChaCha20With64BitNonce;
+        pub const XChaCha20IETF = @import("crypto/chacha20.zig").XChaCha20IETF;
+    };
+
+    pub const salsa = struct {
+        pub const Salsa20 = @import("crypto/salsa20.zig").Salsa20;
+        pub const XSalsa20 = @import("crypto/salsa20.zig").XSalsa20;
+    };
 };
+
+pub const nacl = struct {
+    const salsa20 = @import("crypto/salsa20.zig");
+
+    pub const Box = salsa20.Box;
+    pub const SecretBox = salsa20.SecretBox;
+    pub const SealedBox = salsa20.SealedBox;
+};
+
+pub const utils = @import("crypto/utils.zig");
 
 const std = @import("std.zig");
 pub const randomBytes = std.os.getrandom;
@@ -122,11 +153,13 @@ test "crypto" {
     }
 
     _ = @import("crypto/aes.zig");
+    _ = @import("crypto/bcrypt.zig");
     _ = @import("crypto/blake2.zig");
     _ = @import("crypto/blake3.zig");
     _ = @import("crypto/chacha20.zig");
     _ = @import("crypto/gimli.zig");
     _ = @import("crypto/hmac.zig");
+    _ = @import("crypto/isap.zig");
     _ = @import("crypto/md5.zig");
     _ = @import("crypto/modes.zig");
     _ = @import("crypto/pbkdf2.zig");
@@ -134,6 +167,7 @@ test "crypto" {
     _ = @import("crypto/sha1.zig");
     _ = @import("crypto/sha2.zig");
     _ = @import("crypto/sha3.zig");
+    _ = @import("crypto/salsa20.zig");
     _ = @import("crypto/siphash.zig");
     _ = @import("crypto/25519/curve25519.zig");
     _ = @import("crypto/25519/ed25519.zig");

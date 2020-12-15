@@ -972,7 +972,7 @@ fn tokenizeAndPrintRaw(docgen_tokenizer: *Tokenizer, out: anytype, source_token:
             .Tilde,
             => try writeEscaped(out, src[token.loc.start..token.loc.end]),
 
-            .Invalid, .Invalid_ampersands => return parseError(
+            .Invalid, .Invalid_ampersands, .Invalid_periodasterisks => return parseError(
                 docgen_tokenizer,
                 source_token,
                 "syntax error",
@@ -1251,7 +1251,7 @@ fn genHtml(allocator: *mem.Allocator, tokenizer: *Tokenizer, toc: *Toc, out: any
                             },
                         }
                         if (mem.indexOf(u8, result.stderr, error_match) == null) {
-                            print("{}\nExpected to find '{}' in stderr", .{ result.stderr, error_match });
+                            print("{}\nExpected to find '{}' in stderr\n", .{ result.stderr, error_match });
                             return parseError(tokenizer, code.source_token, "example did not have expected compile error", .{});
                         }
                         const escaped_stderr = try escapeHtml(allocator, result.stderr);
@@ -1306,7 +1306,7 @@ fn genHtml(allocator: *mem.Allocator, tokenizer: *Tokenizer, toc: *Toc, out: any
                             },
                         }
                         if (mem.indexOf(u8, result.stderr, error_match) == null) {
-                            print("{}\nExpected to find '{}' in stderr", .{ result.stderr, error_match });
+                            print("{}\nExpected to find '{}' in stderr\n", .{ result.stderr, error_match });
                             return parseError(tokenizer, code.source_token, "example did not have expected runtime safety error message", .{});
                         }
                         const escaped_stderr = try escapeHtml(allocator, result.stderr);
@@ -1385,7 +1385,7 @@ fn genHtml(allocator: *mem.Allocator, tokenizer: *Tokenizer, toc: *Toc, out: any
                                 },
                             }
                             if (mem.indexOf(u8, result.stderr, error_match) == null) {
-                                print("{}\nExpected to find '{}' in stderr", .{ result.stderr, error_match });
+                                print("{}\nExpected to find '{}' in stderr\n", .{ result.stderr, error_match });
                                 return parseError(tokenizer, code.source_token, "example did not have expected compile error message", .{});
                             }
                             const escaped_stderr = try escapeHtml(allocator, result.stderr);

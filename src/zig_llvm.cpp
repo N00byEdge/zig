@@ -221,6 +221,7 @@ bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMM
     PMBuilder->DisableUnrollLoops = is_debug;
     PMBuilder->SLPVectorize = !is_debug;
     PMBuilder->LoopVectorize = !is_debug;
+    PMBuilder->LoopsInterleaved = !PMBuilder->DisableUnrollLoops;
     PMBuilder->RerollLoops = !is_debug;
     // Leaving NewGVN as default (off) because when on it caused issue #673
     //PMBuilder->NewGVN = !is_debug;
@@ -854,6 +855,14 @@ void ZigLLVMAddModuleCodeViewFlag(LLVMModuleRef module) {
     unwrap(module)->addModuleFlag(Module::Warning, "CodeView", 1);
 }
 
+void ZigLLVMSetModulePICLevel(LLVMModuleRef module) {
+    unwrap(module)->setPICLevel(PICLevel::Level::BigPIC);
+}
+
+void ZigLLVMSetModulePIELevel(LLVMModuleRef module) {
+    unwrap(module)->setPIELevel(PIELevel::Level::Large);
+}
+
 static AtomicOrdering mapFromLLVMOrdering(LLVMAtomicOrdering Ordering) {
     switch (Ordering) {
         case LLVMAtomicOrderingNotAtomic: return AtomicOrdering::NotAtomic;
@@ -1047,35 +1056,24 @@ bool ZigLLVMWriteArchive(const char *archive_name, const char **file_names, size
     return false;
 }
 
+int ZigLLDLinkCOFF(int argc, const char **argv, bool can_exit_early) {
+    std::vector<const char *> args(argv, argv + argc);
+    return lld::coff::link(args, can_exit_early, llvm::outs(), llvm::errs());
+}
 
-bool ZigLLDLink(ZigLLVM_ObjectFormatType oformat, const char **args, size_t arg_count,
-        void (*append_diagnostic)(void *, const char *, size_t),
-        void *context_stdout, void *context_stderr)
-{
-    ArrayRef<const char *> array_ref_args(args, arg_count);
+int ZigLLDLinkELF(int argc, const char **argv, bool can_exit_early) {
+    std::vector<const char *> args(argv, argv + argc);
+    return lld::elf::link(args, can_exit_early, llvm::outs(), llvm::errs());
+}
 
-    MyOStream diag_stdout(append_diagnostic, context_stdout);
-    MyOStream diag_stderr(append_diagnostic, context_stderr);
+int ZigLLDLinkMachO(int argc, const char **argv, bool can_exit_early) {
+    std::vector<const char *> args(argv, argv + argc);
+    return lld::mach_o::link(args, can_exit_early, llvm::outs(), llvm::errs());
+}
 
-    switch (oformat) {
-        case ZigLLVM_UnknownObjectFormat:
-        case ZigLLVM_XCOFF:
-            assert(false); // unreachable
-
-        case ZigLLVM_COFF:
-            return lld::coff::link(array_ref_args, false, diag_stdout, diag_stderr);
-
-        case ZigLLVM_ELF:
-            return lld::elf::link(array_ref_args, false, diag_stdout, diag_stderr);
-
-        case ZigLLVM_MachO:
-            return lld::mach_o::link(array_ref_args, false, diag_stdout, diag_stderr);
-
-        case ZigLLVM_Wasm:
-            return lld::wasm::link(array_ref_args, false, diag_stdout, diag_stderr);
-    }
-    assert(false); // unreachable
-    abort();
+int ZigLLDLinkWasm(int argc, const char **argv, bool can_exit_early) {
+    std::vector<const char *> args(argv, argv + argc);
+    return lld::wasm::link(args, can_exit_early, llvm::outs(), llvm::errs());
 }
 
 static AtomicRMWInst::BinOp toLLVMRMWBinOp(enum ZigLLVM_AtomicRMWBinOp BinOp) {
@@ -1154,6 +1152,22 @@ LLVMValueRef ZigLLVMBuildFPMaxReduce(LLVMBuilderRef B, LLVMValueRef Val) {
 
 LLVMValueRef ZigLLVMBuildFPMinReduce(LLVMBuilderRef B, LLVMValueRef Val) {
     return wrap(unwrap(B)->CreateFPMinReduce(unwrap(Val)));
+}
+
+LLVMValueRef ZigLLVMBuildAddReduce(LLVMBuilderRef B, LLVMValueRef Val) {
+    return wrap(unwrap(B)->CreateAddReduce(unwrap(Val)));
+}
+
+LLVMValueRef ZigLLVMBuildMulReduce(LLVMBuilderRef B, LLVMValueRef Val) {
+    return wrap(unwrap(B)->CreateMulReduce(unwrap(Val)));
+}
+
+LLVMValueRef ZigLLVMBuildFPAddReduce(LLVMBuilderRef B, LLVMValueRef Acc, LLVMValueRef Val) {
+    return wrap(unwrap(B)->CreateFAddReduce(unwrap(Acc), unwrap(Val)));
+}
+
+LLVMValueRef ZigLLVMBuildFPMulReduce(LLVMBuilderRef B, LLVMValueRef Acc, LLVMValueRef Val) {
+    return wrap(unwrap(B)->CreateFMulReduce(unwrap(Acc), unwrap(Val)));
 }
 
 static_assert((Triple::ArchType)ZigLLVM_UnknownArch == Triple::UnknownArch, "");

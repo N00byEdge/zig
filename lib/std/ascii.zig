@@ -230,6 +230,20 @@ pub fn isSpace(c: u8) bool {
     return inTable(c, tIndex.Space);
 }
 
+/// All the values for which isSpace() returns true. This may be used with
+/// e.g. std.mem.trim() to trim whiteSpace.
+pub const spaces = [_]u8{ ' ', '\t', '\n', '\r', control_code.VT, control_code.FF };
+
+test "spaces" {
+    const testing = std.testing;
+    for (spaces) |space| testing.expect(isSpace(space));
+
+    var i: u8 = 0;
+    while (isASCII(i)) : (i += 1) {
+        if (isSpace(i)) testing.expect(std.mem.indexOfScalar(u8, &spaces, i) != null);
+    }
+}
+
 pub fn isUpper(c: u8) bool {
     return inTable(c, tIndex.Upper);
 }
@@ -319,6 +333,24 @@ test "eqlIgnoreCase" {
     std.testing.expect(eqlIgnoreCase("HEl💩Lo!", "hel💩lo!"));
     std.testing.expect(!eqlIgnoreCase("hElLo!", "hello! "));
     std.testing.expect(!eqlIgnoreCase("hElLo!", "helro!"));
+}
+
+pub fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return if (needle.len > haystack.len) false else eqlIgnoreCase(haystack[0..needle.len], needle);
+}
+
+test "ascii.startsWithIgnoreCase" {
+    std.testing.expect(startsWithIgnoreCase("boB", "Bo"));
+    std.testing.expect(!startsWithIgnoreCase("Needle in hAyStAcK", "haystack"));
+}
+
+pub fn endsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return if (needle.len > haystack.len) false else eqlIgnoreCase(haystack[haystack.len - needle.len ..], needle);
+}
+
+test "ascii.endsWithIgnoreCase" {
+    std.testing.expect(endsWithIgnoreCase("Needle in HaYsTaCk", "haystack"));
+    std.testing.expect(!endsWithIgnoreCase("BoB", "Bo"));
 }
 
 /// Finds `substr` in `container`, ignoring case, starting at `start_index`.

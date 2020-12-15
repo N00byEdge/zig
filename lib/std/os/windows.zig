@@ -442,33 +442,30 @@ pub fn ReadFile(in_hFile: HANDLE, buffer: []u8, offset: ?u64, io_mode: std.io.Mo
         }
         return @as(usize, bytes_transferred);
     } else {
-        var index: usize = 0;
-        while (index < buffer.len) {
-            const want_read_count = @intCast(DWORD, math.min(@as(DWORD, maxInt(DWORD)), buffer.len - index));
+        while (true) {
+            const want_read_count = @intCast(DWORD, math.min(@as(DWORD, maxInt(DWORD)), buffer.len));
             var amt_read: DWORD = undefined;
             var overlapped_data: OVERLAPPED = undefined;
             const overlapped: ?*OVERLAPPED = if (offset) |off| blk: {
                 overlapped_data = .{
                     .Internal = 0,
                     .InternalHigh = 0,
-                    .Offset = @truncate(u32, off + index),
-                    .OffsetHigh = @truncate(u32, (off + index) >> 32),
+                    .Offset = @truncate(u32, off),
+                    .OffsetHigh = @truncate(u32, off >> 32),
                     .hEvent = null,
                 };
                 break :blk &overlapped_data;
             } else null;
-            if (kernel32.ReadFile(in_hFile, buffer.ptr + index, want_read_count, &amt_read, overlapped) == 0) {
+            if (kernel32.ReadFile(in_hFile, buffer.ptr, want_read_count, &amt_read, overlapped) == 0) {
                 switch (kernel32.GetLastError()) {
                     .OPERATION_ABORTED => continue,
-                    .BROKEN_PIPE => return index,
-                    .HANDLE_EOF => return index,
+                    .BROKEN_PIPE => return 0,
+                    .HANDLE_EOF => return 0,
                     else => |err| return unexpectedError(err),
                 }
             }
-            if (amt_read == 0) return index;
-            index += amt_read;
+            return amt_read;
         }
-        return index;
     }
 }
 
@@ -555,6 +552,43 @@ pub fn WriteFile(
             }
         }
         return bytes_written;
+    }
+}
+
+pub const SetCurrentDirectoryError = error{
+    NameTooLong,
+    InvalidUtf8,
+    FileNotFound,
+    NotDir,
+    AccessDenied,
+    NoDevice,
+    BadPathName,
+    Unexpected,
+};
+
+pub fn SetCurrentDirectory(path_name: []const u16) SetCurrentDirectoryError!void {
+    const path_len_bytes = math.cast(u16, path_name.len * 2) catch |err| switch (err) {
+        error.Overflow => return error.NameTooLong,
+    };
+
+    var nt_name = UNICODE_STRING{
+        .Length = path_len_bytes,
+        .MaximumLength = path_len_bytes,
+        .Buffer = @intToPtr([*]u16, @ptrToInt(path_name.ptr)),
+    };
+
+    const rc = ntdll.RtlSetCurrentDirectory_U(&nt_name);
+    switch (rc) {
+        .SUCCESS => {},
+        .OBJECT_NAME_INVALID => return error.BadPathName,
+        .OBJECT_NAME_NOT_FOUND => return error.FileNotFound,
+        .OBJECT_PATH_NOT_FOUND => return error.FileNotFound,
+        .NO_MEDIA_IN_DEVICE => return error.NoDevice,
+        .INVALID_PARAMETER => unreachable,
+        .ACCESS_DENIED => return error.AccessDenied,
+        .OBJECT_PATH_SYNTAX_BAD => unreachable,
+        .NOT_A_DIRECTORY => return error.NotDir,
+        else => return unexpectedStatus(rc),
     }
 }
 
@@ -831,7 +865,7 @@ pub fn DeleteFile(sub_path_w: []const u16, options: DeleteFileOptions) DeleteFil
     }
 }
 
-pub const MoveFileError = error{ FileNotFound, Unexpected };
+pub const MoveFileError = error{ FileNotFound, AccessDenied, Unexpected };
 
 pub fn MoveFileEx(old_path: []const u8, new_path: []const u8, flags: DWORD) MoveFileError!void {
     const old_path_w = try sliceToPrefixedFileW(old_path);
@@ -843,6 +877,7 @@ pub fn MoveFileExW(old_path: [*:0]const u16, new_path: [*:0]const u16, flags: DW
     if (kernel32.MoveFileExW(old_path, new_path, flags) == 0) {
         switch (kernel32.GetLastError()) {
             .FILE_NOT_FOUND => return error.FileNotFound,
+            .ACCESS_DENIED => return error.AccessDenied,
             else => |err| return unexpectedError(err),
         }
     }
@@ -1157,6 +1192,14 @@ pub fn WSASocketW(
     return rc;
 }
 
+pub fn bind(s: ws2_32.SOCKET, name: *const ws2_32.sockaddr, namelen: ws2_32.socklen_t) i32 {
+    return ws2_32.bind(s, name, @intCast(i32, namelen));
+}
+
+pub fn listen(s: ws2_32.SOCKET, backlog: u31) i32 {
+    return ws2_32.listen(s, backlog);
+}
+
 pub fn closesocket(s: ws2_32.SOCKET) !void {
     switch (ws2_32.closesocket(s)) {
         0 => {},
@@ -1165,6 +1208,40 @@ pub fn closesocket(s: ws2_32.SOCKET) !void {
         },
         else => unreachable,
     }
+}
+
+pub fn accept(s: ws2_32.SOCKET, name: ?*ws2_32.sockaddr, namelen: ?*ws2_32.socklen_t) ws2_32.SOCKET {
+    assert((name == null) == (namelen == null));
+    return ws2_32.accept(s, name, @ptrCast(?*i32, namelen));
+}
+
+pub fn getsockname(s: ws2_32.SOCKET, name: *ws2_32.sockaddr, namelen: *ws2_32.socklen_t) i32 {
+    return ws2_32.getsockname(s, name, @ptrCast(*i32, namelen));
+}
+
+pub fn sendto(s: ws2_32.SOCKET, buf: [*]const u8, len: usize, flags: u32, to: ?*const ws2_32.sockaddr, to_len: ws2_32.socklen_t) i32 {
+    var buffer = ws2_32.WSABUF{ .len = @truncate(u31, len), .buf = @intToPtr([*]u8, @ptrToInt(buf)) };
+    var bytes_send: DWORD = undefined;
+    if (ws2_32.WSASendTo(s, @ptrCast([*]ws2_32.WSABUF, &buffer), 1, &bytes_send, flags, to, @intCast(i32, to_len), null, null) == ws2_32.SOCKET_ERROR) {
+        return ws2_32.SOCKET_ERROR;
+    } else {
+        return @as(i32, @intCast(u31, bytes_send));
+    }
+}
+
+pub fn recvfrom(s: ws2_32.SOCKET, buf: [*]u8, len: usize, flags: u32, from: ?*ws2_32.sockaddr, from_len: ?*ws2_32.socklen_t) i32 {
+    var buffer = ws2_32.WSABUF{ .len = @truncate(u31, len), .buf = buf };
+    var bytes_received: DWORD = undefined;
+    var flags_inout = flags;
+    if (ws2_32.WSARecvFrom(s, @ptrCast([*]ws2_32.WSABUF, &buffer), 1, &bytes_received, &flags_inout, from, from_len, null, null) == ws2_32.SOCKET_ERROR) {
+        return ws2_32.SOCKET_ERROR;
+    } else {
+        return @as(i32, @intCast(u31, bytes_received));
+    }
+}
+
+pub fn poll(fds: [*]ws2_32.pollfd, n: usize, timeout: i32) i32 {
+    return ws2_32.WSAPoll(fds, @intCast(u32, n), timeout);
 }
 
 pub fn WSAIoctl(

@@ -25,6 +25,30 @@ const tmpDir = std.testing.tmpDir;
 const Dir = std.fs.Dir;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
+test "chdir smoke test" {
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    // Get current working directory path
+    var old_cwd_buf: [fs.MAX_PATH_BYTES]u8 = undefined;
+    const old_cwd = try os.getcwd(old_cwd_buf[0..]);
+
+    {
+        // Firstly, changing to itself should have no effect
+        try os.chdir(old_cwd);
+        var new_cwd_buf: [fs.MAX_PATH_BYTES]u8 = undefined;
+        const new_cwd = try os.getcwd(new_cwd_buf[0..]);
+        expect(mem.eql(u8, old_cwd, new_cwd));
+    }
+    {
+        // Next, change current working directory to one level above
+        const parent = fs.path.dirname(old_cwd) orelse unreachable; // old_cwd should be absolute
+        try os.chdir(parent);
+        var new_cwd_buf: [fs.MAX_PATH_BYTES]u8 = undefined;
+        const new_cwd = try os.getcwd(new_cwd_buf[0..]);
+        expect(mem.eql(u8, parent, new_cwd));
+    }
+}
+
 test "open smoke test" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
@@ -593,11 +617,70 @@ test "fsync" {
 }
 
 test "getrlimit and setrlimit" {
-    // TODO enable for other systems when implemented
-    if(builtin.os.tag != .linux){
+    if (!@hasDecl(os, "rlimit")) {
         return error.SkipZigTest;
     }
 
-    const cpuLimit = try os.getrlimit(.CPU);
-    try os.setrlimit(.CPU, cpuLimit);
+    inline for (std.meta.fields(os.rlimit_resource)) |field| {
+        const resource = @intToEnum(os.rlimit_resource, field.value);
+        const limit = try os.getrlimit(resource);
+        try os.setrlimit(resource, limit);
+    }
+}
+
+test "shutdown socket" {
+    if (builtin.os.tag == .wasi)
+        return error.SkipZigTest;
+    if (builtin.os.tag == .windows) {
+        _ = try std.os.windows.WSAStartup(2, 2);
+    }
+    defer {
+        if (builtin.os.tag == .windows) {
+            std.os.windows.WSACleanup() catch unreachable;
+        }
+    }
+    const sock = try os.socket(os.AF_INET, os.SOCK_STREAM, 0);
+    os.shutdown(sock, .both) catch |err| switch (err) {
+        error.SocketNotConnected => {},
+        else => |e| return e,
+    };
+    os.closeSocket(sock);
+}
+
+var signal_test_failed = true;
+
+test "sigaction" {
+    if (builtin.os.tag == .wasi or builtin.os.tag == .windows)
+        return error.SkipZigTest;
+
+    // https://github.com/ziglang/zig/issues/7427
+    if (builtin.os.tag == .linux and builtin.arch == .i386)
+        return error.SkipZigTest;
+
+    const S = struct {
+        fn handler(sig: i32, info: *const os.siginfo_t, ctx_ptr: ?*const c_void) callconv(.C) void {
+            // Check that we received the correct signal.
+            if (sig == os.SIGUSR1 and sig == info.signo)
+                signal_test_failed = false;
+        }
+    };
+
+    var sa = os.Sigaction{
+        .handler = .{ .sigaction = S.handler },
+        .mask = os.empty_sigset,
+        .flags = os.SA_SIGINFO | os.SA_RESETHAND,
+    };
+    var old_sa: os.Sigaction = undefined;
+    // Install the new signal handler.
+    os.sigaction(os.SIGUSR1, &sa, null);
+    // Check that we can read it back correctly.
+    os.sigaction(os.SIGUSR1, null, &old_sa);
+    testing.expectEqual(S.handler, old_sa.handler.sigaction.?);
+    testing.expect((old_sa.flags & os.SA_SIGINFO) != 0);
+    // Invoke the handler.
+    try os.raise(os.SIGUSR1);
+    testing.expect(signal_test_failed == false);
+    // Check if the handler has been correctly reset to SIG_DFL
+    os.sigaction(os.SIGUSR1, null, &old_sa);
+    testing.expectEqual(os.SIG_DFL, old_sa.handler.sigaction);
 }

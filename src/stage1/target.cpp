@@ -357,6 +357,33 @@ Error target_parse_arch(ZigLLVM_ArchType *out_arch, const char *arch_ptr, size_t
 }
 
 Error target_parse_os(Os *out_os, const char *os_ptr, size_t os_len) {
+    if (mem_eql_str(os_ptr, os_len, "native")) {
+#if defined(ZIG_OS_DARWIN)
+        *out_os = OsMacOSX;
+        return ErrorNone;
+#elif defined(ZIG_OS_WINDOWS)
+        *out_os = OsWindows;
+        return ErrorNone;
+#elif defined(ZIG_OS_LINUX)
+        *out_os = OsLinux;
+        return ErrorNone;
+#elif defined(ZIG_OS_FREEBSD)
+        *out_os = OsFreeBSD;
+        return ErrorNone;
+#elif defined(ZIG_OS_NETBSD)
+        *out_os = OsNetBSD;
+        return ErrorNone;
+#elif defined(ZIG_OS_DRAGONFLY)
+        *out_os = OsDragonFly;
+        return ErrorNone;
+#elif defined(ZIG_OS_OPENBSD)
+        *out_os = OsOpenBSD;
+        return ErrorNone;
+#else
+        zig_panic("stage1 is unable to detect native target for this OS");
+#endif
+    }
+
     for (size_t i = 0; i < array_length(os_list); i += 1) {
         Os os = os_list[i];
         const char *os_name = target_os_name(os);
@@ -1119,8 +1146,6 @@ bool target_is_libc_lib_name(const ZigTarget *target, const char *name) {
             return true;
         if (equal(name, "dl"))
             return true;
-        if (equal(name, "util"))
-            return true;
     }
 
     if (target_os_is_darwin(target->os) && equal(name, "System"))
@@ -1194,6 +1219,10 @@ bool target_libc_needs_crti_crtn(const ZigTarget *target) {
 
 bool target_is_riscv(const ZigTarget *target) {
     return target->arch == ZigLLVM_riscv32 || target->arch == ZigLLVM_riscv64;
+}
+
+bool target_is_sparc(const ZigTarget *target) {
+    return target->arch == ZigLLVM_sparc || target->arch == ZigLLVM_sparcv9;
 }
 
 bool target_is_mips(const ZigTarget *target) {

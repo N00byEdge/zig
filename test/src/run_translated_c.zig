@@ -13,6 +13,7 @@ pub const RunTranslatedCContext = struct {
     step: *build.Step,
     test_index: usize,
     test_filter: ?[]const u8,
+    target: std.zig.CrossTarget,
 
     const TestCase = struct {
         name: []const u8,
@@ -82,17 +83,18 @@ pub const RunTranslatedCContext = struct {
         }
 
         const write_src = b.addWriteFiles();
-        for (case.sources.span()) |src_file| {
+        for (case.sources.items) |src_file| {
             write_src.add(src_file.filename, src_file.source);
         }
         const translate_c = b.addTranslateC(.{
             .write_file = .{
                 .step = write_src,
-                .basename = case.sources.span()[0].filename,
+                .basename = case.sources.items[0].filename,
             },
         });
         translate_c.step.name = b.fmt("{} translate-c", .{annotated_case_name});
         const exe = translate_c.addExecutable();
+        exe.setTarget(self.target);
         exe.step.name = b.fmt("{} build-exe", .{annotated_case_name});
         exe.linkLibC();
         const run = exe.run();

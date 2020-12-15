@@ -19,6 +19,7 @@ const iovec = linux.iovec;
 const iovec_const = linux.iovec_const;
 
 pub const mode_t = usize;
+pub const time_t = isize;
 
 pub const SYS = extern enum(usize) {
     read = 0,
@@ -369,8 +370,10 @@ pub const SYS = extern enum(usize) {
     fspick = 433,
     pidfd_open = 434,
     clone3 = 435,
+    close_range = 436,
     openat2 = 437,
     pidfd_getfd = 438,
+    faccessat2 = 439,
 
     _,
 };
@@ -511,15 +514,11 @@ pub const msghdr_const = extern struct {
 
 pub const off_t = i64;
 pub const ino_t = u64;
+pub const dev_t = u64;
 
-/// Renamed to Stat to not conflict with the stat function.
-/// atime, mtime, and ctime have functions to return `timespec`,
-/// because although this is a POSIX API, the layout and names of
-/// the structs are inconsistent across operating systems, and
-/// in C, macros are used to hide the differences. Here we use
-/// methods to accomplish this.
-pub const Stat = extern struct {
-    dev: u64,
+// The `stat` definition used by the Linux kernel.
+pub const kernel_stat = extern struct {
+    dev: dev_t,
     ino: ino_t,
     nlink: usize,
 
@@ -527,7 +526,7 @@ pub const Stat = extern struct {
     uid: uid_t,
     gid: gid_t,
     __pad0: u32,
-    rdev: u64,
+    rdev: dev_t,
     size: off_t,
     blksize: isize,
     blocks: i64,
@@ -537,18 +536,21 @@ pub const Stat = extern struct {
     ctim: timespec,
     __unused: [3]isize,
 
-    pub fn atime(self: Stat) timespec {
+    pub fn atime(self: @This()) timespec {
         return self.atim;
     }
 
-    pub fn mtime(self: Stat) timespec {
+    pub fn mtime(self: @This()) timespec {
         return self.mtim;
     }
 
-    pub fn ctime(self: Stat) timespec {
+    pub fn ctime(self: @This()) timespec {
         return self.ctim;
     }
 };
+
+// The `stat64` definition used by the libc.
+pub const libc_stat = kernel_stat;
 
 pub const timespec = extern struct {
     tv_sec: isize,

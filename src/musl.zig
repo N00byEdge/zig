@@ -12,8 +12,10 @@ pub const CRTFile = enum {
     crti_o,
     crtn_o,
     crt1_o,
+    rcrt1_o,
     scrt1_o,
     libc_a,
+    libc_so,
 };
 
 pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
@@ -63,6 +65,23 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
                 .{
                     .src_path = try comp.zig_lib_directory.join(arena, &[_][]const u8{
                         "libc", "musl", "crt", "crt1.c",
+                    }),
+                    .extra_flags = args.items,
+                },
+            });
+        },
+        .rcrt1_o => {
+            var args = std.ArrayList([]const u8).init(arena);
+            try add_cc_args(comp, arena, &args, false);
+            try args.appendSlice(&[_][]const u8{
+                "-fPIC",
+                "-fno-stack-protector",
+                "-DCRT",
+            });
+            return comp.build_crt_file("rcrt1", .Obj, &[1]Compilation.CSourceFile{
+                .{
+                    .src_path = try comp.zig_lib_directory.join(arena, &[_][]const u8{
+                        "libc", "musl", "crt", "rcrt1.c",
                     }),
                     .extra_flags = args.items,
                 },
@@ -122,7 +141,7 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
 
                 const dirname = path.dirname(src_file).?;
                 const basename = path.basename(src_file);
-                const noextbasename = mem.split(basename, ".").next().?;
+                const noextbasename = basename[0 .. basename.len - std.fs.path.extension(basename).len];
                 const before_arch_dir = path.dirname(dirname).?;
                 const dirbasename = path.basename(dirname);
 
@@ -170,6 +189,59 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
                 };
             }
             return comp.build_crt_file("c", .Lib, c_source_files.items);
+        },
+        .libc_so => {
+            const sub_compilation = try Compilation.create(comp.gpa, .{
+                .local_cache_directory = comp.global_cache_directory,
+                .global_cache_directory = comp.global_cache_directory,
+                .zig_lib_directory = comp.zig_lib_directory,
+                .target = comp.getTarget(),
+                .root_name = "c",
+                .root_pkg = null,
+                .output_mode = .Lib,
+                .link_mode = .Dynamic,
+                .rand = comp.rand,
+                .libc_installation = comp.bin_file.options.libc_installation,
+                .emit_bin = Compilation.EmitLoc{ .directory = null, .basename = "libc.so" },
+                .optimize_mode = comp.bin_file.options.optimize_mode,
+                .want_sanitize_c = false,
+                .want_stack_check = false,
+                .want_valgrind = false,
+                .emit_h = null,
+                .strip = comp.bin_file.options.strip,
+                .is_native_os = false,
+                .is_native_abi = false,
+                .self_exe_path = comp.self_exe_path,
+                .verbose_cc = comp.verbose_cc,
+                .verbose_link = comp.bin_file.options.verbose_link,
+                .verbose_tokenize = comp.verbose_tokenize,
+                .verbose_ast = comp.verbose_ast,
+                .verbose_ir = comp.verbose_ir,
+                .verbose_llvm_ir = comp.verbose_llvm_ir,
+                .verbose_cimport = comp.verbose_cimport,
+                .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
+                .clang_passthrough_mode = comp.clang_passthrough_mode,
+                .c_source_files = &[_]Compilation.CSourceFile{
+                    .{ .src_path = try comp.zig_lib_directory.join(arena, &[_][]const u8{ "libc", "musl", "libc.s" }) },
+                },
+                .is_compiler_rt_or_libc = true,
+                .soname = "libc.so",
+            });
+            defer sub_compilation.destroy();
+
+            try sub_compilation.updateSubCompilation();
+
+            try comp.crt_files.ensureCapacity(comp.gpa, comp.crt_files.count() + 1);
+
+            const basename = try comp.gpa.dupe(u8, "libc.so");
+            errdefer comp.gpa.free(basename);
+
+            comp.crt_files.putAssumeCapacityNoClobber(basename, .{
+                .full_object_path = try sub_compilation.bin_file.options.emit.?.directory.join(comp.gpa, &[_][]const u8{
+                    sub_compilation.bin_file.options.emit.?.sub_path,
+                }),
+                .lock = sub_compilation.bin_file.toOwnedLock(),
+            });
         },
     }
 }
@@ -656,13 +728,17 @@ const src_files = [_][]const u8{
     "musl/src/locale/uselocale.c",
     "musl/src/locale/wcscoll.c",
     "musl/src/locale/wcsxfrm.c",
-    "musl/src/malloc/aligned_alloc.c",
-    "musl/src/malloc/expand_heap.c",
+    "musl/src/malloc/calloc.c",
     "musl/src/malloc/lite_malloc.c",
-    "musl/src/malloc/malloc.c",
-    "musl/src/malloc/malloc_usable_size.c",
+    "musl/src/malloc/mallocng/aligned_alloc.c",
+    "musl/src/malloc/mallocng/donate.c",
+    "musl/src/malloc/mallocng/free.c",
+    "musl/src/malloc/mallocng/malloc.c",
+    "musl/src/malloc/mallocng/malloc_usable_size.c",
+    "musl/src/malloc/mallocng/realloc.c",
     "musl/src/malloc/memalign.c",
     "musl/src/malloc/posix_memalign.c",
+    "musl/src/malloc/replaced.c",
     "musl/src/math/__cos.c",
     "musl/src/math/__cosdf.c",
     "musl/src/math/__cosl.c",
@@ -834,23 +910,23 @@ const src_files = [_][]const u8{
     "musl/src/math/i386/exp_ld.s",
     "musl/src/math/i386/expl.s",
     "musl/src/math/i386/expm1l.s",
-    "musl/src/math/i386/fabs.s",
-    "musl/src/math/i386/fabsf.s",
-    "musl/src/math/i386/fabsl.s",
+    "musl/src/math/i386/fabs.c",
+    "musl/src/math/i386/fabsf.c",
+    "musl/src/math/i386/fabsl.c",
     "musl/src/math/i386/floor.s",
     "musl/src/math/i386/floorf.s",
     "musl/src/math/i386/floorl.s",
-    "musl/src/math/i386/fmod.s",
-    "musl/src/math/i386/fmodf.s",
-    "musl/src/math/i386/fmodl.s",
+    "musl/src/math/i386/fmod.c",
+    "musl/src/math/i386/fmodf.c",
+    "musl/src/math/i386/fmodl.c",
     "musl/src/math/i386/hypot.s",
     "musl/src/math/i386/hypotf.s",
     "musl/src/math/i386/ldexp.s",
     "musl/src/math/i386/ldexpf.s",
     "musl/src/math/i386/ldexpl.s",
-    "musl/src/math/i386/llrint.s",
-    "musl/src/math/i386/llrintf.s",
-    "musl/src/math/i386/llrintl.s",
+    "musl/src/math/i386/llrint.c",
+    "musl/src/math/i386/llrintf.c",
+    "musl/src/math/i386/llrintl.c",
     "musl/src/math/i386/log.s",
     "musl/src/math/i386/log10.s",
     "musl/src/math/i386/log10f.s",
@@ -863,27 +939,27 @@ const src_files = [_][]const u8{
     "musl/src/math/i386/log2l.s",
     "musl/src/math/i386/logf.s",
     "musl/src/math/i386/logl.s",
-    "musl/src/math/i386/lrint.s",
-    "musl/src/math/i386/lrintf.s",
-    "musl/src/math/i386/lrintl.s",
-    "musl/src/math/i386/remainder.s",
-    "musl/src/math/i386/remainderf.s",
-    "musl/src/math/i386/remainderl.s",
+    "musl/src/math/i386/lrint.c",
+    "musl/src/math/i386/lrintf.c",
+    "musl/src/math/i386/lrintl.c",
+    "musl/src/math/i386/remainder.c",
+    "musl/src/math/i386/remainderf.c",
+    "musl/src/math/i386/remainderl.c",
     "musl/src/math/i386/remquo.s",
     "musl/src/math/i386/remquof.s",
     "musl/src/math/i386/remquol.s",
-    "musl/src/math/i386/rint.s",
-    "musl/src/math/i386/rintf.s",
-    "musl/src/math/i386/rintl.s",
+    "musl/src/math/i386/rint.c",
+    "musl/src/math/i386/rintf.c",
+    "musl/src/math/i386/rintl.c",
     "musl/src/math/i386/scalbln.s",
     "musl/src/math/i386/scalblnf.s",
     "musl/src/math/i386/scalblnl.s",
     "musl/src/math/i386/scalbn.s",
     "musl/src/math/i386/scalbnf.s",
     "musl/src/math/i386/scalbnl.s",
-    "musl/src/math/i386/sqrt.s",
-    "musl/src/math/i386/sqrtf.s",
-    "musl/src/math/i386/sqrtl.s",
+    "musl/src/math/i386/sqrt.c",
+    "musl/src/math/i386/sqrtf.c",
+    "musl/src/math/i386/sqrtl.c",
     "musl/src/math/i386/trunc.s",
     "musl/src/math/i386/truncf.s",
     "musl/src/math/i386/truncl.s",
@@ -935,6 +1011,7 @@ const src_files = [_][]const u8{
     "musl/src/math/lround.c",
     "musl/src/math/lroundf.c",
     "musl/src/math/lroundl.c",
+    "musl/src/math/m68k/sqrtl.c",
     "musl/src/math/mips/fabs.c",
     "musl/src/math/mips/fabsf.c",
     "musl/src/math/mips/sqrt.c",
@@ -1113,28 +1190,29 @@ const src_files = [_][]const u8{
     "musl/src/math/x86_64/exp2l.s",
     "musl/src/math/x86_64/expl.s",
     "musl/src/math/x86_64/expm1l.s",
-    "musl/src/math/x86_64/fabs.s",
-    "musl/src/math/x86_64/fabsf.s",
-    "musl/src/math/x86_64/fabsl.s",
+    "musl/src/math/x86_64/fabs.c",
+    "musl/src/math/x86_64/fabsf.c",
+    "musl/src/math/x86_64/fabsl.c",
     "musl/src/math/x86_64/floorl.s",
     "musl/src/math/x86_64/fma.c",
     "musl/src/math/x86_64/fmaf.c",
-    "musl/src/math/x86_64/fmodl.s",
-    "musl/src/math/x86_64/llrint.s",
-    "musl/src/math/x86_64/llrintf.s",
-    "musl/src/math/x86_64/llrintl.s",
+    "musl/src/math/x86_64/fmodl.c",
+    "musl/src/math/x86_64/llrint.c",
+    "musl/src/math/x86_64/llrintf.c",
+    "musl/src/math/x86_64/llrintl.c",
     "musl/src/math/x86_64/log10l.s",
     "musl/src/math/x86_64/log1pl.s",
     "musl/src/math/x86_64/log2l.s",
     "musl/src/math/x86_64/logl.s",
-    "musl/src/math/x86_64/lrint.s",
-    "musl/src/math/x86_64/lrintf.s",
-    "musl/src/math/x86_64/lrintl.s",
-    "musl/src/math/x86_64/remainderl.s",
-    "musl/src/math/x86_64/rintl.s",
-    "musl/src/math/x86_64/sqrt.s",
-    "musl/src/math/x86_64/sqrtf.s",
-    "musl/src/math/x86_64/sqrtl.s",
+    "musl/src/math/x86_64/lrint.c",
+    "musl/src/math/x86_64/lrintf.c",
+    "musl/src/math/x86_64/lrintl.c",
+    "musl/src/math/x86_64/remainderl.c",
+    "musl/src/math/x86_64/remquol.c",
+    "musl/src/math/x86_64/rintl.c",
+    "musl/src/math/x86_64/sqrt.c",
+    "musl/src/math/x86_64/sqrtf.c",
+    "musl/src/math/x86_64/sqrtl.c",
     "musl/src/math/x86_64/truncl.s",
     "musl/src/misc/a64l.c",
     "musl/src/misc/basename.c",
@@ -1528,7 +1606,6 @@ const src_files = [_][]const u8{
     "musl/src/stdio/__stdio_seek.c",
     "musl/src/stdio/__stdio_write.c",
     "musl/src/stdio/__stdout_write.c",
-    "musl/src/stdio/__string_read.c",
     "musl/src/stdio/__toread.c",
     "musl/src/stdio/__towrite.c",
     "musl/src/stdio/__uflow.c",
@@ -1654,10 +1731,11 @@ const src_files = [_][]const u8{
     "musl/src/stdlib/strtol.c",
     "musl/src/stdlib/wcstod.c",
     "musl/src/stdlib/wcstol.c",
+    "musl/src/string/aarch64/memcpy.S",
+    "musl/src/string/aarch64/memset.S",
     "musl/src/string/arm/__aeabi_memcpy.s",
     "musl/src/string/arm/__aeabi_memset.s",
-    "musl/src/string/arm/memcpy.c",
-    "musl/src/string/arm/memcpy_le.S",
+    "musl/src/string/arm/memcpy.S",
     "musl/src/string/bcmp.c",
     "musl/src/string/bcopy.c",
     "musl/src/string/bzero.c",

@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2015-2020 Zig Contributors
+// This file is part of [zig](https://ziglang.org/), which is MIT licensed.
+// The MIT license requires this copyright notice to be included in all copies
+// and substantial portions of the software.
+
 const std = @import("../../../std.zig");
 const linux = std.os.linux;
 const socklen_t = linux.socklen_t;
@@ -398,8 +404,10 @@ pub const SYS = extern enum(usize) {
     fspick = 433,
     pidfd_open = 434,
     clone3 = 435,
+    close_range = 436,
     openat2 = 437,
     pidfd_getfd = 438,
+    faccessat2 = 439,
 
     _,
 };
@@ -510,13 +518,8 @@ pub const ino_t = u64;
 pub const dev_t = u64;
 pub const blkcnt_t = i64;
 
-/// Renamed to Stat to not conflict with the stat function.
-/// atime, mtime, and ctime have functions to return `timespec`,
-/// because although this is a POSIX API, the layout and names of
-/// the structs are inconsistent across operating systems, and
-/// in C, macros are used to hide the differences. Here we use
-/// methods to accomplish this.
-pub const Stat = extern struct {
+// The `stat` definition used by the Linux kernel.
+pub const kernel_stat = extern struct {
     dev: dev_t,
     ino: ino_t,
     nlink: nlink_t,
@@ -532,18 +535,21 @@ pub const Stat = extern struct {
     ctim: timespec,
     __unused: [3]u64,
 
-    pub fn atime(self: Stat) timespec {
+    pub fn atime(self: @This()) timespec {
         return self.atim;
     }
 
-    pub fn mtime(self: Stat) timespec {
+    pub fn mtime(self: @This()) timespec {
         return self.mtim;
     }
 
-    pub fn ctime(self: Stat) timespec {
+    pub fn ctime(self: @This()) timespec {
         return self.ctim;
     }
 };
+
+// The `stat64` definition used by the libc.
+pub const libc_stat = kernel_stat;
 
 pub const timespec = extern struct {
     tv_sec: time_t,
