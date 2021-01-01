@@ -91,8 +91,6 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
                     "-D_CRTBLD",
                     "-D_WIN32_WINNT=0x0f00",
                     "-D__MSVCRT_VERSION__=0x700",
-                    "-g",
-                    "-O2",
                 });
                 c_source_files[i] = .{
                     .src_path = try comp.zig_lib_directory.join(arena, &[_][]const u8{
@@ -119,9 +117,6 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
 
                 "-isystem",
                 try comp.zig_lib_directory.join(arena, &[_][]const u8{ "libc", "include", "any-windows-any" }),
-
-                "-g",
-                "-O2",
             });
             var c_source_files = std.ArrayList(Compilation.CSourceFile).init(arena);
 
@@ -167,8 +162,6 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
                 "-D_CRTBLD",
                 "-D_WIN32_WINNT=0x0f00",
                 "-D__MSVCRT_VERSION__=0x700",
-                "-g",
-                "-O2",
 
                 "-isystem",
                 try comp.zig_lib_directory.join(arena, &[_][]const u8{ "libc", "include", "any-windows-any" }),
@@ -233,8 +226,6 @@ pub fn buildCRTFile(comp: *Compilation, crt_file: CRTFile) !void {
                 "-D_CRTBLD",
                 "-D_WIN32_WINNT=0x0f00",
                 "-D__MSVCRT_VERSION__=0x700",
-                "-g",
-                "-O2",
 
                 "-isystem",
                 try comp.zig_lib_directory.join(arena, &[_][]const u8{
@@ -414,7 +405,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
     });
     errdefer comp.gpa.free(lib_final_path);
 
-    const llvm = @import("llvm.zig");
+    const llvm = @import("llvm_bindings.zig");
     const arch_type = @import("target.zig").archToLLVM(target.cpu.arch);
     const def_final_path_z = try arena.dupeZ(u8, def_final_path);
     const lib_final_path_z = try arena.dupeZ(u8, lib_final_path);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -45,6 +45,15 @@ pub const pthread_cond_t = extern struct {
 pub const pthread_attr_t = extern struct {
     __size: [56]u8,
     __align: c_long,
+};
+
+pub const sem_t = extern struct {
+    _magic: u32,
+    _kern: extern struct {
+        _count: u32,
+        _flags: u32,
+    },
+    _padding: u32,
 };
 
 pub const EAI = extern enum(c_int) {

@@ -328,6 +328,47 @@ pub const Context = struct {
     }
 };
 
+fn addCBuiltinsNamespace(c: *Context) Error!void {
+    // pub usingnamespace @import("std").c.builtins;
+    const pub_tok = try appendToken(c, .Keyword_pub, "pub");
+    const use_tok = try appendToken(c, .Keyword_usingnamespace, "usingnamespace");
+    const import_tok = try appendToken(c, .Builtin, "@import");
+    const lparen_tok = try appendToken(c, .LParen, "(");
+    const std_tok = try appendToken(c, .StringLiteral, "\"std\"");
+    const rparen_tok = try appendToken(c, .RParen, ")");
+
+    const std_node = try c.arena.create(ast.Node.OneToken);
+    std_node.* = .{
+        .base = .{ .tag = .StringLiteral },
+        .token = std_tok,
+    };
+
+    const call_node = try ast.Node.BuiltinCall.alloc(c.arena, 1);
+    call_node.* = .{
+        .builtin_token = import_tok,
+        .params_len = 1,
+        .rparen_token = rparen_tok,
+    };
+    call_node.params()[0] = &std_node.base;
+
+    var access_chain = &call_node.base;
+    access_chain = try transCreateNodeFieldAccess(c, access_chain, "c");
+    access_chain = try transCreateNodeFieldAccess(c, access_chain, "builtins");
+
+    const semi_tok = try appendToken(c, .Semicolon, ";");
+
+    const bytes = try c.gpa.alignedAlloc(u8, @alignOf(ast.Node.Use), @sizeOf(ast.Node.Use));
+    const using_node = @ptrCast(*ast.Node.Use, bytes.ptr);
+    using_node.* = .{
+        .doc_comments = null,
+        .visib_token = pub_tok,
+        .use_token = use_tok,
+        .expr = access_chain,
+        .semicolon_token = semi_tok,
+    };
+    try c.root_decls.append(c.gpa, &using_node.base);
+}
+
 pub fn translate(
     gpa: *mem.Allocator,
     args_begin: [*]?[*]const u8,
@@ -376,6 +417,8 @@ pub fn translate(
         context.root_decls.deinit(gpa);
         context.opaque_demotes.deinit(gpa);
     }
+
+    try addCBuiltinsNamespace(&context);
 
     try prepopulateGlobalNameTable(ast_unit, &context);
 
@@ -507,7 +550,7 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
     const fn_decl_loc = fn_decl.getLocation();
     const has_body = fn_decl.hasBody();
     const storage_class = fn_decl.getStorageClass();
-    const decl_ctx = FnDeclContext{
+    var decl_ctx = FnDeclContext{
         .fn_name = fn_name,
         .has_body = has_body,
         .storage_class = storage_class,
@@ -541,6 +584,12 @@ fn visitFnDecl(c: *Context, fn_decl: *const clang.FunctionDecl) Error!void {
     const proto_node = switch (fn_type.getTypeClass()) {
         .FunctionProto => blk: {
             const fn_proto_type = @ptrCast(*const clang.FunctionProtoType, fn_type);
+            if (has_body and fn_proto_type.isVariadic()) {
+                decl_ctx.has_body = false;
+                decl_ctx.storage_class = .Extern;
+                decl_ctx.is_export = false;
+                try emitWarning(c, fn_decl_loc, "TODO unable to translate variadic function, demoted to declaration", .{});
+            }
             break :blk transFnProto(rp, fn_decl, fn_proto_type, fn_decl_loc, decl_ctx, true) catch |err| switch (err) {
                 error.UnsupportedType => {
                     return failDecl(c, fn_decl_loc, fn_name, "unable to resolve prototype of function", .{});
@@ -1726,6 +1775,9 @@ fn transImplicitCastExpr(
             const rhs_node = try transCreateNodeInt(rp.c, 0);
             return transCreateNodeInfixOp(rp, scope, sub_expr_node, .BangEqual, op_token, rhs_node, result_used, false);
         },
+        .BuiltinFnToFnPtr => {
+            return transExpr(rp, scope, sub_expr, .used, .r_value);
+        },
         else => |kind| return revertAndWarn(
             rp,
             error.UnsupportedTranslation,
@@ -1795,6 +1847,10 @@ fn exprIsStringLiteral(expr: *const clang.Expr) bool {
         .PredefinedExprClass => return true,
         .UnaryOperatorClass => {
             const op_expr = @ptrCast(*const clang.UnaryOperator, expr).getSubExpr();
+            return exprIsStringLiteral(op_expr);
+        },
+        .ParenExprClass => {
+            const op_expr = @ptrCast(*const clang.ParenExpr, expr).getSubExpr();
             return exprIsStringLiteral(op_expr);
         },
         else => return false,
@@ -2024,7 +2080,6 @@ fn transCCast(
         // 1. If src_type is an enum, determine the underlying signed int type
         // 2. Extend or truncate without changing signed-ness.
         // 3. Bit-cast to correct signed-ness
-
         const src_type_is_signed = cIsSignedInteger(src_type) or cIsEnum(src_type);
         const src_int_type = if (cIsInteger(src_type)) src_type else cIntTypeForEnum(src_type);
         const src_int_expr = if (cIsInteger(src_type)) expr else try transEnumToInt(rp.c, expr);
@@ -2111,33 +2166,20 @@ fn transCCast(
     }
     if (qualTypeIsBoolean(src_type) and !qualTypeIsBoolean(dst_type)) {
         // @boolToInt returns either a comptime_int or a u1
+        // TODO: if dst_type is 1 bit & signed (bitfield) we need @bitCast
+        // instead of @as
+
         const builtin_node = try rp.c.createBuiltinCall("@boolToInt", 1);
         builtin_node.params()[0] = expr;
         builtin_node.rparen_token = try appendToken(rp.c, .RParen, ")");
 
-        const inner_cast_node = try rp.c.createBuiltinCall("@intCast", 2);
-        inner_cast_node.params()[0] = try transCreateNodeIdentifier(rp.c, "u1");
+        const as_node = try rp.c.createBuiltinCall("@as", 2);
+        as_node.params()[0] = try transQualType(rp, dst_type, loc);
         _ = try appendToken(rp.c, .Comma, ",");
-        inner_cast_node.params()[1] = &builtin_node.base;
-        inner_cast_node.rparen_token = try appendToken(rp.c, .RParen, ")");
+        as_node.params()[1] = &builtin_node.base;
+        as_node.rparen_token = try appendToken(rp.c, .RParen, ")");
 
-        const cast_node = try rp.c.createBuiltinCall("@intCast", 2);
-        cast_node.params()[0] = try transQualType(rp, dst_type, loc);
-        _ = try appendToken(rp.c, .Comma, ",");
-
-        if (cIsSignedInteger(dst_type)) {
-            const bitcast_node = try rp.c.createBuiltinCall("@bitCast", 2);
-            bitcast_node.params()[0] = try transCreateNodeIdentifier(rp.c, "i1");
-            _ = try appendToken(rp.c, .Comma, ",");
-            bitcast_node.params()[1] = &inner_cast_node.base;
-            bitcast_node.rparen_token = try appendToken(rp.c, .RParen, ")");
-            cast_node.params()[1] = &bitcast_node.base;
-        } else {
-            cast_node.params()[1] = &inner_cast_node.base;
-        }
-        cast_node.rparen_token = try appendToken(rp.c, .RParen, ")");
-
-        return &cast_node.base;
+        return &as_node.base;
     }
     if (cIsEnum(dst_type)) {
         const builtin_node = try rp.c.createBuiltinCall("@intToEnum", 2);
@@ -3044,8 +3086,9 @@ fn transCallExpr(rp: RestorePoint, scope: *Scope, stmt: *const clang.CallExpr, r
     const fn_expr = if (is_ptr and fn_ty != null) blk: {
         if (callee.getStmtClass() == .ImplicitCastExprClass) {
             const implicit_cast = @ptrCast(*const clang.ImplicitCastExpr, callee);
-
-            if (implicit_cast.getCastKind() == .FunctionToPointerDecay) {
+            const cast_kind = implicit_cast.getCastKind();
+            if (cast_kind == .BuiltinFnToFnPtr) break :blk raw_fn_expr;
+            if (cast_kind == .FunctionToPointerDecay) {
                 const subexpr = implicit_cast.getSubExpr();
                 if (subexpr.getStmtClass() == .DeclRefExprClass) {
                     const decl_ref = @ptrCast(*const clang.DeclRefExpr, subexpr);
@@ -5877,7 +5920,7 @@ fn parseCPrimaryExprInner(c: *Context, m: *MacroCtx, scope: *Scope) ParseError!*
                 return error.ParseError;
             }
 
-            const ident_token = try appendTokenFmt(c, .Identifier, "{}_{}", .{slice, m.slice()});
+            const ident_token = try appendTokenFmt(c, .Identifier, "{}_{}", .{ slice, m.slice() });
             const identifier = try c.arena.create(ast.Node.OneToken);
             identifier.* = .{
                 .base = .{ .tag = .Identifier },

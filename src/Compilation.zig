@@ -26,6 +26,11 @@ const Module = @import("Module.zig");
 const Cache = @import("Cache.zig");
 const stage1 = @import("stage1.zig");
 const translate_c = @import("translate_c.zig");
+const c_codegen = @import("codegen/c.zig");
+const c_link = @import("link/C.zig");
+const ThreadPool = @import("ThreadPool.zig");
+const WaitGroup = @import("WaitGroup.zig");
+const libtsan = @import("libtsan.zig");
 
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: *Allocator,
@@ -41,7 +46,12 @@ link_error_flags: link.File.ErrorFlags = .{},
 
 work_queue: std.fifo.LinearFifo(Job, .Dynamic),
 
+/// These jobs are to invoke the Clang compiler to create an object file, which
+/// gets linked with the Compilation.
+c_object_work_queue: std.fifo.LinearFifo(*CObject, .Dynamic),
+
 /// The ErrorMsg memory is owned by the `CObject`, using Compilation's general purpose allocator.
+/// This data is accessed by multiple threads and is protected by `mutex`.
 failed_c_objects: std.AutoArrayHashMapUnmanaged(*CObject, *ErrorMsg) = .{},
 
 keep_source_files_loaded: bool,
@@ -74,7 +84,7 @@ zig_lib_directory: Directory,
 local_cache_directory: Directory,
 global_cache_directory: Directory,
 libc_include_dir_list: []const []const u8,
-rand: *std.rand.Random,
+thread_pool: *ThreadPool,
 
 /// Populated when we build the libc++ static library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
@@ -85,6 +95,9 @@ libcxxabi_static_lib: ?CRTFile = null,
 /// Populated when we build the libunwind static library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 libunwind_static_lib: ?CRTFile = null,
+/// Populated when we build the TSAN static library. A Job to build this is placed in the queue
+/// and resolved before calling linker.flush().
+tsan_static_lib: ?CRTFile = null,
 /// Populated when we build the libssp static library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
 libssp_static_lib: ?CRTFile = null,
@@ -112,15 +125,22 @@ owned_link_dir: ?std.fs.Dir,
 /// Don't use this for anything other than stage1 compatibility.
 color: @import("main.zig").Color = .auto,
 
+/// This mutex guards all `Compilation` mutable state.
+mutex: std.Mutex = .{},
+
 test_filter: ?[]const u8,
 test_name_prefix: ?[]const u8,
 test_evented_io: bool,
+debug_compiler_runtime_libs: bool,
 
-emit_h: ?EmitLoc,
 emit_asm: ?EmitLoc,
 emit_llvm_ir: ?EmitLoc,
 emit_analysis: ?EmitLoc,
 emit_docs: ?EmitLoc,
+
+c_header: ?c_link.Header,
+
+work_queue_wait_group: WaitGroup,
 
 pub const InnerError = Module.InnerError;
 
@@ -151,9 +171,6 @@ const Job = union(enum) {
     /// The source file containing the Decl has been updated, and so the
     /// Decl may need its line number information updated in the debug info.
     update_line_number: *Module.Decl,
-    /// Invoke the Clang compiler to create an object file, which gets linked
-    /// with the Compilation.
-    c_object: *CObject,
 
     /// one of the glibc static objects
     glibc_crt_file: glibc.CRTFile,
@@ -167,6 +184,7 @@ const Job = union(enum) {
     libunwind: void,
     libcxx: void,
     libcxxabi: void,
+    libtsan: void,
     libssp: void,
     compiler_rt_lib: void,
     compiler_rt_obj: void,
@@ -331,7 +349,7 @@ pub const InitOptions = struct {
     root_name: []const u8,
     root_pkg: ?*Package,
     output_mode: std.builtin.OutputMode,
-    rand: *std.rand.Random,
+    thread_pool: *ThreadPool,
     dynamic_linker: ?[]const u8 = null,
     /// `null` means to not emit a binary file.
     emit_bin: ?EmitLoc,
@@ -376,6 +394,7 @@ pub const InitOptions = struct {
     want_sanitize_c: ?bool = null,
     want_stack_check: ?bool = null,
     want_valgrind: ?bool = null,
+    want_tsan: ?bool = null,
     want_compiler_rt: ?bool = null,
     use_llvm: ?bool = null,
     use_lld: ?bool = null,
@@ -411,7 +430,12 @@ pub const InitOptions = struct {
     verbose_llvm_cpu_features: bool = false,
     is_test: bool = false,
     test_evented_io: bool = false,
-    is_compiler_rt_or_libc: bool = false,
+    debug_compiler_runtime_libs: bool = false,
+    /// Normally when you create a `Compilation`, Zig will automatically build
+    /// and link in required dependencies, such as compiler-rt and libc. When
+    /// building such dependencies themselves, this flag must be set to avoid
+    /// infinite recursion.
+    skip_linker_dependencies: bool = false,
     parent_compilation_link_libc: bool = false,
     stack_size_override: ?u64 = null,
     image_base_override: ?u64 = null,
@@ -481,7 +505,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
         .Lib => is_dyn_lib,
         .Exe => true,
     };
-    const needs_c_symbols = !options.is_compiler_rt_or_libc and
+    const needs_c_symbols = !options.skip_linker_dependencies and
         (is_exe_or_dyn_lib or (options.target.isWasm() and options.output_mode != .Obj));
 
     const comp: *Compilation = comp: {
@@ -571,7 +595,9 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             break :outer opts;
         } else .{};
 
-        const link_libc = options.link_libc or target_util.osRequiresLibC(options.target);
+        const tsan = options.want_tsan orelse false;
+
+        const link_libc = options.link_libc or target_util.osRequiresLibC(options.target) or tsan;
 
         const must_dynamic_link = dl: {
             if (target_util.cannotDynamicLink(options.target))
@@ -633,12 +659,12 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
         );
 
         const must_pie = target_util.requiresPIE(options.target);
-        const pie = if (options.want_pie) |explicit| pie: {
+        const pie: bool = if (options.want_pie) |explicit| pie: {
             if (!explicit and must_pie) {
                 return error.TargetRequiresPIE;
             }
             break :pie explicit;
-        } else must_pie;
+        } else must_pie or tsan;
 
         const must_pic: bool = b: {
             if (target_util.requiresPIC(options.target, link_libc))
@@ -656,6 +682,9 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             }
             break :pic explicit;
         } else pie or must_pic;
+
+        // TSAN is implemented in C++ so it requires linking libc++.
+        const link_libcpp = options.link_libcpp or tsan;
 
         // Make a decision on whether to use Clang for translate-c and compiling C files.
         const use_clang = if (options.use_clang) |explicit| explicit else blk: {
@@ -739,12 +768,13 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
         cache.hash.add(ofmt);
         cache.hash.add(pic);
         cache.hash.add(pie);
+        cache.hash.add(tsan);
         cache.hash.add(stack_check);
         cache.hash.add(link_mode);
         cache.hash.add(options.function_sections);
         cache.hash.add(strip);
         cache.hash.add(link_libc);
-        cache.hash.add(options.link_libcpp);
+        cache.hash.add(link_libcpp);
         cache.hash.add(options.output_mode);
         cache.hash.add(options.machine_code_model);
         cache.hash.addOptionalEmitLoc(options.emit_bin);
@@ -772,7 +802,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             hash.add(single_threaded);
             hash.add(dll_export_fns);
             hash.add(options.is_test);
-            hash.add(options.is_compiler_rt_or_libc);
+            hash.add(options.skip_linker_dependencies);
             hash.add(options.parent_compilation_link_libc);
 
             const digest = hash.final();
@@ -795,9 +825,11 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
 
             const root_scope = rs: {
                 if (mem.endsWith(u8, root_pkg.root_src_path, ".zig")) {
-                    const struct_payload = try gpa.create(Type.Payload.EmptyStruct);
                     const root_scope = try gpa.create(Module.Scope.File);
-                    struct_payload.* = .{ .scope = &root_scope.root_container };
+                    const struct_ty = try Type.Tag.empty_struct.create(
+                        gpa,
+                        &root_scope.root_container,
+                    );
                     root_scope.* = .{
                         // TODO this is duped so it can be freed in Container.deinit
                         .sub_file_path = try gpa.dupe(u8, root_pkg.root_src_path),
@@ -808,7 +840,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
                         .root_container = .{
                             .file_scope = root_scope,
                             .decls = .{},
-                            .ty = Type.initPayload(&struct_payload.base),
+                            .ty = struct_ty,
                         },
                     };
                     break :rs &root_scope.base;
@@ -888,10 +920,6 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             };
         };
 
-        if (!use_llvm and options.emit_h != null) {
-            fatal("TODO implement support for -femit-h in the self-hosted backend", .{});
-        }
-
         var system_libs: std.StringArrayHashMapUnmanaged(void) = .{};
         errdefer system_libs.deinit(gpa);
         try system_libs.ensureCapacity(gpa, options.system_libs.len);
@@ -913,7 +941,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .use_llvm = use_llvm,
             .system_linker_hack = darwin_options.system_linker_hack,
             .link_libc = link_libc,
-            .link_libcpp = options.link_libcpp,
+            .link_libcpp = link_libcpp,
             .objects = options.link_objects,
             .frameworks = options.frameworks,
             .framework_dirs = options.framework_dirs,
@@ -945,6 +973,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .pic = pic,
             .pie = pie,
             .valgrind = valgrind,
+            .tsan = tsan,
             .stack_check = stack_check,
             .single_threaded = single_threaded,
             .verbose_link = options.verbose_link,
@@ -952,7 +981,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .dll_export_fns = dll_export_fns,
             .error_return_tracing = error_return_tracing,
             .llvm_cpu_features = llvm_cpu_features,
-            .is_compiler_rt_or_libc = options.is_compiler_rt_or_libc,
+            .skip_linker_dependencies = options.skip_linker_dependencies,
             .parent_compilation_link_libc = options.parent_compilation_link_libc,
             .each_lib_rpath = options.each_lib_rpath orelse options.is_native_os,
             .disable_lld_caching = options.disable_lld_caching,
@@ -967,12 +996,13 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .local_cache_directory = options.local_cache_directory,
             .global_cache_directory = options.global_cache_directory,
             .bin_file = bin_file,
-            .emit_h = options.emit_h,
+            .c_header = if (!use_llvm and options.emit_h != null) c_link.Header.init(gpa, options.emit_h) else null,
             .emit_asm = options.emit_asm,
             .emit_llvm_ir = options.emit_llvm_ir,
             .emit_analysis = options.emit_analysis,
             .emit_docs = options.emit_docs,
             .work_queue = std.fifo.LinearFifo(Job, .Dynamic).init(gpa),
+            .c_object_work_queue = std.fifo.LinearFifo(*CObject, .Dynamic).init(gpa),
             .keep_source_files_loaded = options.keep_source_files_loaded,
             .use_clang = use_clang,
             .clang_argv = options.clang_argv,
@@ -981,7 +1011,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .self_exe_path = options.self_exe_path,
             .libc_include_dir_list = libc_dirs.libc_include_dir_list,
             .sanitize_c = sanitize_c,
-            .rand = options.rand,
+            .thread_pool = options.thread_pool,
             .clang_passthrough_mode = options.clang_passthrough_mode,
             .clang_preprocessor_mode = options.clang_preprocessor_mode,
             .verbose_cc = options.verbose_cc,
@@ -999,10 +1029,15 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .test_filter = options.test_filter,
             .test_name_prefix = options.test_name_prefix,
             .test_evented_io = options.test_evented_io,
+            .debug_compiler_runtime_libs = options.debug_compiler_runtime_libs,
+            .work_queue_wait_group = undefined,
         };
         break :comp comp;
     };
     errdefer comp.destroy();
+
+    try comp.work_queue_wait_group.init();
+    errdefer comp.work_queue_wait_group.deinit();
 
     if (comp.bin_file.options.module) |mod| {
         try comp.work_queue.writeItem(.{ .generate_builtin_zig = {} });
@@ -1021,7 +1056,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
         comp.c_object_table.putAssumeCapacityNoClobber(c_object, {});
     }
 
-    if (comp.bin_file.options.emit != null and !comp.bin_file.options.is_compiler_rt_or_libc) {
+    if (comp.bin_file.options.emit != null and !comp.bin_file.options.skip_linker_dependencies) {
         // If we need to build glibc for the target, add work items for it.
         // We go through the work queue so that building can be done in parallel.
         if (comp.wantBuildGLibCFromSource()) {
@@ -1074,11 +1109,12 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
         if (comp.wantBuildLibUnwindFromSource()) {
             try comp.work_queue.writeItem(.{ .libunwind = {} });
         }
-        if (build_options.have_llvm and comp.bin_file.options.output_mode != .Obj and
-            comp.bin_file.options.link_libcpp)
-        {
+        if (build_options.have_llvm and is_exe_or_dyn_lib and comp.bin_file.options.link_libcpp) {
             try comp.work_queue.writeItem(.libcxx);
             try comp.work_queue.writeItem(.libcxxabi);
+        }
+        if (build_options.have_llvm and comp.bin_file.options.tsan) {
+            try comp.work_queue.writeItem(.libtsan);
         }
 
         // The `is_stage1` condition is here only because stage2 cannot yet build compiler-rt.
@@ -1177,8 +1213,14 @@ pub fn destroy(self: *Compilation) void {
     }
     self.failed_c_objects.deinit(gpa);
 
+    if (self.c_header) |*header| {
+        header.deinit();
+    }
+
     self.cache_parent.manifest_dir.close();
     if (self.owned_link_dir) |*dir| dir.close();
+
+    self.work_queue_wait_group.deinit();
 
     // This destroys `self`.
     self.arena_state.promote(gpa).deinit();
@@ -1193,11 +1235,13 @@ pub fn update(self: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
+    self.c_object_cache_digest_set.clearRetainingCapacity();
+
     // For compiling C objects, we rely on the cache hash system to avoid duplicating work.
     // Add a Job for each C object.
-    try self.work_queue.ensureUnusedCapacity(self.c_object_table.items().len);
+    try self.c_object_work_queue.ensureUnusedCapacity(self.c_object_table.items().len);
     for (self.c_object_table.items()) |entry| {
-        self.work_queue.writeItemAssumeCapacity(.{ .c_object = entry.key });
+        self.c_object_work_queue.writeItemAssumeCapacity(entry.key);
     }
 
     const use_stage1 = build_options.is_stage1 and self.bin_file.options.use_llvm;
@@ -1275,6 +1319,20 @@ pub fn update(self: *Compilation) !void {
         if (self.bin_file.options.module) |module| {
             module.root_scope.unload(self.gpa);
         }
+    }
+
+    // If we've chosen to emit a C header, flush the header to the disk.
+    if (self.c_header) |header| {
+        const header_path = header.emit_loc.?;
+        // If a directory has been provided, write the header there. Otherwise, just write it to the
+        // cache directory.
+        const header_dir = if (header_path.directory) |dir|
+            dir.handle
+        else
+            self.local_cache_directory.handle;
+        const header_file = try header_dir.createFile(header_path.basename, .{});
+        defer header_file.close();
+        try header.flush(header_file.writer());
     }
 }
 
@@ -1368,12 +1426,22 @@ pub fn getAllErrorsAlloc(self: *Compilation) !AllErrors {
 
 pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemory }!void {
     var progress: std.Progress = .{};
-    var main_progress_node = try progress.start("", null);
+    var main_progress_node = try progress.start("", 0);
     defer main_progress_node.end();
     if (self.color == .off) progress.terminal = null;
 
     var c_comp_progress_node = main_progress_node.start("Compile C Objects", self.c_source_files.len);
     defer c_comp_progress_node.end();
+
+    self.work_queue_wait_group.reset();
+    defer self.work_queue_wait_group.wait();
+
+    while (self.c_object_work_queue.readItem()) |c_object| {
+        self.work_queue_wait_group.start();
+        try self.thread_pool.spawn(workerUpdateCObject, .{
+            self, c_object, &c_comp_progress_node, &self.work_queue_wait_group,
+        });
+    }
 
     while (self.work_queue.readItem()) |work_item| switch (work_item) {
         .codegen_decl => |decl| switch (decl.analysis) {
@@ -1389,11 +1457,12 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
 
             .complete, .codegen_failure_retryable => {
                 const module = self.bin_file.options.module.?;
-                if (decl.typed_value.most_recent.typed_value.val.cast(Value.Payload.Function)) |payload| {
-                    switch (payload.func.analysis) {
-                        .queued => module.analyzeFnBody(decl, payload.func) catch |err| switch (err) {
+                if (decl.typed_value.most_recent.typed_value.val.castTag(.function)) |payload| {
+                    const func = payload.data;
+                    switch (func.analysis) {
+                        .queued => module.analyzeFnBody(decl, func) catch |err| switch (err) {
                             error.AnalysisFail => {
-                                assert(payload.func.analysis != .in_progress);
+                                assert(func.analysis != .in_progress);
                                 continue;
                             },
                             error.OutOfMemory => return error.OutOfMemory,
@@ -1407,27 +1476,49 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
                     var decl_arena = decl.typed_value.most_recent.arena.?.promote(module.gpa);
                     defer decl.typed_value.most_recent.arena.?.* = decl_arena.state;
                     log.debug("analyze liveness of {}\n", .{decl.name});
-                    try liveness.analyze(module.gpa, &decl_arena.allocator, payload.func.analysis.success);
+                    try liveness.analyze(module.gpa, &decl_arena.allocator, func.analysis.success);
                 }
 
                 assert(decl.typed_value.most_recent.typed_value.ty.hasCodeGenBits());
 
-                self.bin_file.updateDecl(module, decl) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.AnalysisFail => {
-                        decl.analysis = .dependency_failure;
-                    },
-                    else => {
-                        try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
-                        module.failed_decls.putAssumeCapacityNoClobber(decl, try ErrorMsg.create(
-                            module.gpa,
-                            decl.src(),
-                            "unable to codegen: {}",
-                            .{@errorName(err)},
-                        ));
-                        decl.analysis = .codegen_failure_retryable;
-                    },
+                self.bin_file.updateDecl(module, decl) catch |err| {
+                    switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.AnalysisFail => {
+                            decl.analysis = .dependency_failure;
+                        },
+                        else => {
+                            try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
+                            module.failed_decls.putAssumeCapacityNoClobber(decl, try ErrorMsg.create(
+                                module.gpa,
+                                decl.src(),
+                                "unable to codegen: {}",
+                                .{@errorName(err)},
+                            ));
+                            decl.analysis = .codegen_failure_retryable;
+                        },
+                    }
+                    return;
                 };
+
+                if (self.c_header) |*header| {
+                    c_codegen.generateHeader(self, module, header, decl) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.AnalysisFail => {
+                            decl.analysis = .dependency_failure;
+                        },
+                        else => {
+                            try module.failed_decls.ensureCapacity(module.gpa, module.failed_decls.items().len + 1);
+                            module.failed_decls.putAssumeCapacityNoClobber(decl, try ErrorMsg.create(
+                                module.gpa,
+                                decl.src(),
+                                "unable to generate C header: {}",
+                                .{@errorName(err)},
+                            ));
+                            decl.analysis = .codegen_failure_retryable;
+                        },
+                    };
+                }
             },
         },
         .analyze_decl => |decl| {
@@ -1448,21 +1539,6 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
                     .{@errorName(err)},
                 ));
                 decl.analysis = .codegen_failure_retryable;
-            };
-        },
-        .c_object => |c_object| {
-            self.updateCObject(c_object, &c_comp_progress_node) catch |err| switch (err) {
-                error.AnalysisFail => continue,
-                else => {
-                    try self.failed_c_objects.ensureCapacity(self.gpa, self.failed_c_objects.items().len + 1);
-                    self.failed_c_objects.putAssumeCapacityNoClobber(c_object, try ErrorMsg.create(
-                        self.gpa,
-                        0,
-                        "unable to build C object: {s}",
-                        .{@errorName(err)},
-                    ));
-                    c_object.status = .{ .failure = {} };
-                },
             };
         },
         .glibc_crt_file => |crt_file| {
@@ -1514,6 +1590,12 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
                 fatal("unable to build libcxxabi: {}", .{@errorName(err)});
             };
         },
+        .libtsan => {
+            libtsan.buildTsan(self) catch |err| {
+                // TODO Expose this as a normal compile error rather than crashing here.
+                fatal("unable to build TSAN library: {}", .{@errorName(err)});
+            };
+        },
         .compiler_rt_lib => {
             self.buildOutputFromZig("compiler_rt.zig", .Lib, &self.compiler_rt_static_lib) catch |err| {
                 // TODO Expose this as a normal compile error rather than crashing here.
@@ -1550,13 +1632,13 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
                 unreachable;
 
             self.updateStage1Module(main_progress_node) catch |err| {
-                fatal("unable to build stage1 zig object: {}", .{@errorName(err)});
+                fatal("unable to build stage1 zig object: {s}", .{@errorName(err)});
             };
         },
     };
 }
 
-pub fn obtainCObjectCacheManifest(comp: *Compilation) Cache.Manifest {
+pub fn obtainCObjectCacheManifest(comp: *const Compilation) Cache.Manifest {
     var man = comp.cache_parent.obtain();
 
     // Only things that need to be added on top of the base hash, and only things
@@ -1711,6 +1793,37 @@ pub fn cImport(comp: *Compilation, c_src: []const u8) !CImportResult {
     };
 }
 
+fn workerUpdateCObject(
+    comp: *Compilation,
+    c_object: *CObject,
+    progress_node: *std.Progress.Node,
+    wg: *WaitGroup,
+) void {
+    defer wg.finish();
+
+    comp.updateCObject(c_object, progress_node) catch |err| switch (err) {
+        error.AnalysisFail => return,
+        else => {
+            {
+                const lock = comp.mutex.acquire();
+                defer lock.release();
+                comp.failed_c_objects.ensureCapacity(comp.gpa, comp.failed_c_objects.items().len + 1) catch {
+                    fatal("TODO handle this by setting c_object.status = oom failure", .{});
+                };
+                comp.failed_c_objects.putAssumeCapacityNoClobber(c_object, ErrorMsg.create(
+                    comp.gpa,
+                    0,
+                    "unable to build C object: {s}",
+                    .{@errorName(err)},
+                ) catch {
+                    fatal("TODO handle this by setting c_object.status = oom failure", .{});
+                });
+            }
+            c_object.status = .{ .failure = {} };
+        },
+    };
+}
+
 fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *std.Progress.Node) !void {
     if (!build_options.have_llvm) {
         return comp.failCObj(c_object, "clang not available: compiler built without LLVM extensions", .{});
@@ -1723,6 +1836,8 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *
 
     if (c_object.clearStatus(comp.gpa)) {
         // There was previous failure.
+        const lock = comp.mutex.acquire();
+        defer lock.release();
         comp.failed_c_objects.removeAssertDiscard(c_object);
     }
 
@@ -1750,8 +1865,16 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *
     }
 
     {
-        const gop = try comp.c_object_cache_digest_set.getOrPut(comp.gpa, man.hash.peekBin());
-        if (gop.found_existing) {
+        const is_collision = blk: {
+            const bin_digest = man.hash.peekBin();
+
+            const lock = comp.mutex.acquire();
+            defer lock.release();
+
+            const gop = try comp.c_object_cache_digest_set.getOrPut(comp.gpa, bin_digest);
+            break :blk gop.found_existing;
+        };
+        if (is_collision) {
             return comp.failCObj(
                 c_object,
                 "the same source file was already added to the same compilation with the same flags",
@@ -1767,7 +1890,7 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *
     const c_source_basename = std.fs.path.basename(c_object.src.src_path);
 
     c_comp_progress_node.activate();
-    var child_progress_node = c_comp_progress_node.start(c_source_basename, null);
+    var child_progress_node = c_comp_progress_node.start(c_source_basename, 0);
     child_progress_node.activate();
     defer child_progress_node.end();
 
@@ -1909,7 +2032,7 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *
 
 pub fn tmpFilePath(comp: *Compilation, arena: *Allocator, suffix: []const u8) error{OutOfMemory}![]const u8 {
     const s = std.fs.path.sep_str;
-    const rand_int = comp.rand.int(u64);
+    const rand_int = std.crypto.random.int(u64);
     if (comp.local_cache_directory.path) |p| {
         return std.fmt.allocPrint(arena, "{}" ++ s ++ "tmp" ++ s ++ "{x}-{s}", .{ p, rand_int, suffix });
     } else {
@@ -1932,7 +2055,7 @@ pub fn addTranslateCCArgs(
 
 /// Add common C compiler args between translate-c and C object compilation.
 pub fn addCCArgs(
-    comp: *Compilation,
+    comp: *const Compilation,
     arena: *Allocator,
     argv: *std.ArrayList([]const u8),
     ext: FileExt,
@@ -1983,7 +2106,7 @@ pub fn addCCArgs(
         try argv.append("-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS");
     }
 
-    const llvm_triple = try @import("codegen/llvm.zig").targetTriple(arena, target);
+    const llvm_triple = try @import("llvm_backend.zig").targetTriple(arena, target);
     try argv.appendSlice(&[_][]const u8{ "-target", llvm_triple });
 
     switch (ext) {
@@ -2079,9 +2202,14 @@ pub fn addCCArgs(
                 try argv.append("-fomit-frame-pointer");
             }
 
-            if (comp.sanitize_c) {
+            if (comp.sanitize_c and !comp.bin_file.options.tsan) {
                 try argv.append("-fsanitize=undefined");
                 try argv.append("-fsanitize-trap=undefined");
+            } else if (comp.sanitize_c and comp.bin_file.options.tsan) {
+                try argv.append("-fsanitize=undefined,thread");
+                try argv.append("-fsanitize-trap=undefined");
+            } else if (!comp.sanitize_c and comp.bin_file.options.tsan) {
+                try argv.append("-fsanitize=thread");
             }
 
             switch (comp.bin_file.options.optimize_mode) {
@@ -2167,10 +2295,14 @@ fn failCObj(comp: *Compilation, c_object: *CObject, comptime format: []const u8,
 
 fn failCObjWithOwnedErrorMsg(comp: *Compilation, c_object: *CObject, err_msg: *ErrorMsg) InnerError {
     {
-        errdefer err_msg.destroy(comp.gpa);
-        try comp.failed_c_objects.ensureCapacity(comp.gpa, comp.failed_c_objects.items().len + 1);
+        const lock = comp.mutex.acquire();
+        defer lock.release();
+        {
+            errdefer err_msg.destroy(comp.gpa);
+            try comp.failed_c_objects.ensureCapacity(comp.gpa, comp.failed_c_objects.items().len + 1);
+        }
+        comp.failed_c_objects.putAssumeCapacityNoClobber(c_object, err_msg);
     }
-    comp.failed_c_objects.putAssumeCapacityNoClobber(c_object, err_msg);
     c_object.status = .failure;
     return error.AnalysisFail;
 }
@@ -2327,7 +2459,7 @@ test "classifyFileExt" {
     std.testing.expectEqual(FileExt.zir, classifyFileExt("foo.zir"));
 }
 
-fn haveFramePointer(comp: *Compilation) bool {
+fn haveFramePointer(comp: *const Compilation) bool {
     // If you complicate this logic make sure you update the parent cache hash.
     // Right now it's not in the cache hash because the value depends on optimize_mode
     // and strip which are both already part of the hash.
@@ -2649,7 +2781,7 @@ pub fn generateBuiltinZigSource(comp: *Compilation, allocator: *Allocator) ![]u8
     // in. For example, compiler_rt will not export the __chkstk symbol if it
     // knows libc will provide it, and likewise c.zig will not export memcpy.
     const link_libc = comp.bin_file.options.link_libc or
-        (comp.bin_file.options.is_compiler_rt_or_libc and comp.bin_file.options.parent_compilation_link_libc);
+        (comp.bin_file.options.skip_linker_dependencies and comp.bin_file.options.parent_compilation_link_libc);
 
     try buffer.writer().print(
         \\pub const object_format = ObjectFormat.{};
@@ -2762,14 +2894,6 @@ fn buildOutputFromZig(
         .directory = null, // Put it in the cache directory.
         .basename = bin_basename,
     };
-    const optimize_mode: std.builtin.Mode = blk: {
-        if (comp.bin_file.options.is_test)
-            break :blk comp.bin_file.options.optimize_mode;
-        switch (comp.bin_file.options.optimize_mode) {
-            .Debug, .ReleaseFast, .ReleaseSafe => break :blk .ReleaseFast,
-            .ReleaseSmall => break :blk .ReleaseSmall,
-        }
-    };
     const sub_compilation = try Compilation.create(comp.gpa, .{
         .global_cache_directory = comp.global_cache_directory,
         .local_cache_directory = comp.global_cache_directory,
@@ -2778,19 +2902,20 @@ fn buildOutputFromZig(
         .root_name = root_name,
         .root_pkg = &root_pkg,
         .output_mode = fixed_output_mode,
-        .rand = comp.rand,
+        .thread_pool = comp.thread_pool,
         .libc_installation = comp.bin_file.options.libc_installation,
         .emit_bin = emit_bin,
-        .optimize_mode = optimize_mode,
+        .optimize_mode = comp.compilerRtOptMode(),
         .link_mode = .Static,
         .function_sections = true,
         .want_sanitize_c = false,
         .want_stack_check = false,
         .want_valgrind = false,
+        .want_tsan = false,
         .want_pic = comp.bin_file.options.pic,
         .want_pie = comp.bin_file.options.pie,
         .emit_h = null,
-        .strip = comp.bin_file.options.strip,
+        .strip = comp.compilerRtStrip(),
         .is_native_os = comp.bin_file.options.is_native_os,
         .is_native_abi = comp.bin_file.options.is_native_abi,
         .self_exe_path = comp.self_exe_path,
@@ -2803,7 +2928,7 @@ fn buildOutputFromZig(
         .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
-        .is_compiler_rt_or_libc = true,
+        .skip_linker_dependencies = true,
         .parent_compilation_link_libc = comp.bin_file.options.link_libc,
     });
     defer sub_compilation.destroy();
@@ -2863,11 +2988,15 @@ fn updateStage1Module(comp: *Compilation, main_progress_node: *std.Progress.Node
     man.hash.add(comp.bin_file.options.function_sections);
     man.hash.add(comp.bin_file.options.is_test);
     man.hash.add(comp.bin_file.options.emit != null);
-    man.hash.addOptionalEmitLoc(comp.emit_h);
+    man.hash.add(comp.c_header != null);
+    if (comp.c_header) |header| {
+        man.hash.addEmitLoc(header.emit_loc.?);
+    }
     man.hash.addOptionalEmitLoc(comp.emit_asm);
     man.hash.addOptionalEmitLoc(comp.emit_llvm_ir);
     man.hash.addOptionalEmitLoc(comp.emit_analysis);
     man.hash.addOptionalEmitLoc(comp.emit_docs);
+    man.hash.add(comp.test_evented_io);
     man.hash.addOptionalBytes(comp.test_filter);
     man.hash.addOptionalBytes(comp.test_name_prefix);
 
@@ -2875,7 +3004,12 @@ fn updateStage1Module(comp: *Compilation, main_progress_node: *std.Progress.Node
     const prev_hash_state = man.hash.peekBin();
     const input_file_count = man.files.items.len;
 
-    if (try man.hit()) {
+    const hit = man.hit() catch |err| {
+        const i = man.failed_file_index orelse return err;
+        const file_path = man.files.items[i].path orelse return err;
+        fatal("unable to build stage1 zig object: {s}: {s}", .{ @errorName(err), file_path });
+    };
+    if (hit) {
         const digest = man.final();
 
         // We use an extra hex-encoded byte here to store some flags.
@@ -2961,10 +3095,10 @@ fn updateStage1Module(comp: *Compilation, main_progress_node: *std.Progress.Node
         });
         break :blk try directory.join(arena, &[_][]const u8{bin_basename});
     } else "";
-    if (comp.emit_h != null) {
+    if (comp.c_header != null) {
         log.warn("-femit-h is not available in the stage1 backend; no .h file will be produced", .{});
     }
-    const emit_h_path = try stage1LocPath(arena, comp.emit_h, directory);
+    const emit_h_path = try stage1LocPath(arena, if (comp.c_header) |header| header.emit_loc else null, directory);
     const emit_asm_path = try stage1LocPath(arena, comp.emit_asm, directory);
     const emit_llvm_ir_path = try stage1LocPath(arena, comp.emit_llvm_ir, directory);
     const emit_analysis_path = try stage1LocPath(arena, comp.emit_analysis, directory);
@@ -3011,6 +3145,7 @@ fn updateStage1Module(comp: *Compilation, main_progress_node: *std.Progress.Node
         .dll_export_fns = comp.bin_file.options.dll_export_fns,
         .link_mode_dynamic = comp.bin_file.options.link_mode == .Dynamic,
         .valgrind_enabled = comp.bin_file.options.valgrind,
+        .tsan_enabled = comp.bin_file.options.tsan,
         .function_sections = comp.bin_file.options.function_sections,
         .enable_stack_probing = comp.bin_file.options.stack_check,
         .enable_time_report = comp.time_report,
@@ -3151,17 +3286,18 @@ pub fn build_crt_file(
         .root_name = root_name,
         .root_pkg = null,
         .output_mode = output_mode,
-        .rand = comp.rand,
+        .thread_pool = comp.thread_pool,
         .libc_installation = comp.bin_file.options.libc_installation,
         .emit_bin = emit_bin,
-        .optimize_mode = comp.bin_file.options.optimize_mode,
+        .optimize_mode = comp.compilerRtOptMode(),
         .want_sanitize_c = false,
         .want_stack_check = false,
         .want_valgrind = false,
+        .want_tsan = false,
         .want_pic = comp.bin_file.options.pic,
         .want_pie = comp.bin_file.options.pie,
         .emit_h = null,
-        .strip = comp.bin_file.options.strip,
+        .strip = comp.compilerRtStrip(),
         .is_native_os = comp.bin_file.options.is_native_os,
         .is_native_abi = comp.bin_file.options.is_native_abi,
         .self_exe_path = comp.self_exe_path,
@@ -3175,7 +3311,7 @@ pub fn build_crt_file(
         .verbose_cimport = comp.verbose_cimport,
         .verbose_llvm_cpu_features = comp.verbose_llvm_cpu_features,
         .clang_passthrough_mode = comp.clang_passthrough_mode,
-        .is_compiler_rt_or_libc = true,
+        .skip_linker_dependencies = true,
         .parent_compilation_link_libc = comp.bin_file.options.link_libc,
     });
     defer sub_compilation.destroy();
@@ -3196,7 +3332,7 @@ pub fn stage1AddLinkLib(comp: *Compilation, lib_name: []const u8) !void {
     // Avoid deadlocking on building import libs such as kernel32.lib
     // This can happen when the user uses `build-exe foo.obj -lkernel32` and then
     // when we create a sub-Compilation for zig libc, it also tries to build kernel32.lib.
-    if (comp.bin_file.options.is_compiler_rt_or_libc) return;
+    if (comp.bin_file.options.skip_linker_dependencies) return;
 
     // This happens when an `extern "foo"` function is referenced by the stage1 backend.
     // If we haven't seen this library yet and we're targeting Windows, we need to queue up
@@ -3206,5 +3342,28 @@ pub fn stage1AddLinkLib(comp: *Compilation, lib_name: []const u8) !void {
         try comp.work_queue.writeItem(.{
             .windows_import_lib = comp.bin_file.options.system_libs.count() - 1,
         });
+    }
+}
+
+/// This decides the optimization mode for all zig-provided libraries, including
+/// compiler-rt, libcxx, libc, libunwind, etc.
+pub fn compilerRtOptMode(comp: Compilation) std.builtin.Mode {
+    if (comp.debug_compiler_runtime_libs) {
+        return comp.bin_file.options.optimize_mode;
+    }
+    switch (comp.bin_file.options.optimize_mode) {
+        .Debug, .ReleaseSafe => return target_util.defaultCompilerRtOptimizeMode(comp.getTarget()),
+        .ReleaseFast => return .ReleaseFast,
+        .ReleaseSmall => return .ReleaseSmall,
+    }
+}
+
+/// This decides whether to strip debug info for all zig-provided libraries, including
+/// compiler-rt, libcxx, libc, libunwind, etc.
+pub fn compilerRtStrip(comp: Compilation) bool {
+    if (comp.debug_compiler_runtime_libs) {
+        return comp.bin_file.options.strip;
+    } else {
+        return true;
     }
 }

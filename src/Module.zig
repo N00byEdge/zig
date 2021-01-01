@@ -37,6 +37,7 @@ root_scope: *Scope,
 /// It's rare for a decl to be exported, so we save memory by having a sparse map of
 /// Decl pointers to details about them being exported.
 /// The Export memory is owned by the `export_owners` table; the slice itself is owned by this table.
+/// The slice is guaranteed to not be empty.
 decl_exports: std.AutoArrayHashMapUnmanaged(*Decl, []*Export) = .{},
 /// We track which export is associated with the given symbol name for quick
 /// detection of symbol collisions.
@@ -277,6 +278,8 @@ pub const Decl = struct {
 };
 
 /// Fn struct memory is owned by the Decl's TypedValue.Managed arena allocator.
+/// Extern functions do not have this data structure; they are represented by
+/// the `Decl` only, with a `Value` tag of `extern_fn`.
 pub const Fn = struct {
     /// This memory owned by the Decl's TypedValue.Managed arena allocator.
     analysis: union(enum) {
@@ -559,7 +562,7 @@ pub const Scope = struct {
         pub fn deinit(self: *Container, gpa: *Allocator) void {
             self.decls.deinit(gpa);
             // TODO either Container of File should have an arena for sub_file_path and ty
-            gpa.destroy(self.ty.cast(Type.Payload.EmptyStruct).?);
+            gpa.destroy(self.ty.castTag(.empty_struct).?);
             gpa.free(self.file_scope.sub_file_path);
             self.* = undefined;
         }
@@ -796,11 +799,15 @@ pub const Scope = struct {
         /// The first N instructions in a function body ZIR are arg instructions.
         instructions: std.ArrayListUnmanaged(*zir.Inst) = .{},
         label: ?Label = null,
+        break_block: ?*zir.Inst.Block = null,
+        continue_block: ?*zir.Inst.Block = null,
+        /// only valid if label != null or (continue_block and break_block) != null
+        break_result_loc: astgen.ResultLoc = undefined,
 
         pub const Label = struct {
             token: ast.TokenIndex,
             block_inst: *zir.Inst.Block,
-            result_loc: astgen.ResultLoc,
+            used: bool = false,
         };
     };
 
@@ -1006,8 +1013,6 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             defer fn_type_scope.instructions.deinit(self.gpa);
 
             decl.is_pub = fn_proto.getVisibToken() != null;
-            const body_node = fn_proto.getBodyNode() orelse
-                return self.failTok(&fn_type_scope.base, fn_proto.fn_token, "TODO implement extern functions", .{});
 
             const param_decls = fn_proto.params();
             const param_types = try fn_type_scope.arena.alloc(*zir.Inst, param_decls.len);
@@ -1079,6 +1084,32 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             const fn_type = try zir_sema.analyzeBodyValueAsType(self, &block_scope, fn_type_inst, .{
                 .instructions = fn_type_scope.instructions.items,
             });
+            const body_node = fn_proto.getBodyNode() orelse {
+                // Extern function.
+                var type_changed = true;
+                if (decl.typedValueManaged()) |tvm| {
+                    type_changed = !tvm.typed_value.ty.eql(fn_type);
+
+                    tvm.deinit(self.gpa);
+                }
+                const fn_val = try Value.Tag.extern_fn.create(&decl_arena.allocator, decl);
+
+                decl_arena_state.* = decl_arena.state;
+                decl.typed_value = .{
+                    .most_recent = .{
+                        .typed_value = .{ .ty = fn_type, .val = fn_val },
+                        .arena = decl_arena_state,
+                    },
+                };
+                decl.analysis = .complete;
+                decl.generation = self.generation;
+
+                try self.comp.bin_file.allocateDeclIndexes(decl);
+                try self.comp.work_queue.writeItem(.{ .codegen_decl = decl });
+
+                return type_changed;
+            };
+
             const new_func = try decl_arena.allocator.create(Fn);
             const fn_payload = try decl_arena.allocator.create(Value.Payload.Function);
 
@@ -1152,7 +1183,10 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 .analysis = .{ .queued = fn_zir },
                 .owner_decl = decl,
             };
-            fn_payload.* = .{ .func = new_func };
+            fn_payload.* = .{
+                .base = .{ .tag = .function },
+                .data = new_func,
+            };
 
             var prev_type_has_bits = false;
             var type_changed = true;
@@ -1340,7 +1374,6 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
             }
 
             const new_variable = try decl_arena.allocator.create(Var);
-            const var_payload = try decl_arena.allocator.create(Value.Payload.Variable);
             new_variable.* = .{
                 .owner_decl = decl,
                 .init = var_info.val orelse undefined,
@@ -1348,14 +1381,14 @@ fn astGenAndAnalyzeDecl(self: *Module, decl: *Decl) !bool {
                 .is_mutable = is_mutable,
                 .is_threadlocal = is_threadlocal,
             };
-            var_payload.* = .{ .variable = new_variable };
+            const var_val = try Value.Tag.variable.create(&decl_arena.allocator, new_variable);
 
             decl_arena_state.* = decl_arena.state;
             decl.typed_value = .{
                 .most_recent = .{
                     .typed_value = .{
                         .ty = var_info.ty,
-                        .val = Value.initPayload(&var_payload.base),
+                        .val = var_val,
                     },
                     .arena = decl_arena_state,
                 },
@@ -1895,7 +1928,13 @@ pub fn resolveDefinedValue(self: *Module, scope: *Scope, base: *Inst) !?Value {
     return null;
 }
 
-pub fn analyzeExport(self: *Module, scope: *Scope, src: usize, borrowed_symbol_name: []const u8, exported_decl: *Decl) !void {
+pub fn analyzeExport(
+    self: *Module,
+    scope: *Scope,
+    src: usize,
+    borrowed_symbol_name: []const u8,
+    exported_decl: *Decl,
+) !void {
     try self.ensureDeclAnalyzed(exported_decl);
     const typed_value = exported_decl.typed_value.most_recent.typed_value;
     switch (typed_value.ty.zigTypeTag()) {
@@ -2191,52 +2230,43 @@ pub fn constBool(self: *Module, scope: *Scope, src: usize, v: bool) !*Inst {
 }
 
 pub fn constIntUnsigned(self: *Module, scope: *Scope, src: usize, ty: Type, int: u64) !*Inst {
-    const int_payload = try scope.arena().create(Value.Payload.Int_u64);
-    int_payload.* = .{ .int = int };
-
     return self.constInst(scope, src, .{
         .ty = ty,
-        .val = Value.initPayload(&int_payload.base),
+        .val = try Value.Tag.int_u64.create(scope.arena(), int),
     });
 }
 
 pub fn constIntSigned(self: *Module, scope: *Scope, src: usize, ty: Type, int: i64) !*Inst {
-    const int_payload = try scope.arena().create(Value.Payload.Int_i64);
-    int_payload.* = .{ .int = int };
-
     return self.constInst(scope, src, .{
         .ty = ty,
-        .val = Value.initPayload(&int_payload.base),
+        .val = try Value.Tag.int_i64.create(scope.arena(), int),
     });
 }
 
 pub fn constIntBig(self: *Module, scope: *Scope, src: usize, ty: Type, big_int: BigIntConst) !*Inst {
-    const val_payload = if (big_int.positive) blk: {
+    if (big_int.positive) {
         if (big_int.to(u64)) |x| {
             return self.constIntUnsigned(scope, src, ty, x);
         } else |err| switch (err) {
             error.NegativeIntoUnsigned => unreachable,
             error.TargetTooSmall => {}, // handled below
         }
-        const big_int_payload = try scope.arena().create(Value.Payload.IntBigPositive);
-        big_int_payload.* = .{ .limbs = big_int.limbs };
-        break :blk &big_int_payload.base;
-    } else blk: {
+        return self.constInst(scope, src, .{
+            .ty = ty,
+            .val = try Value.Tag.int_big_positive.create(scope.arena(), big_int.limbs),
+        });
+    } else {
         if (big_int.to(i64)) |x| {
             return self.constIntSigned(scope, src, ty, x);
         } else |err| switch (err) {
             error.NegativeIntoUnsigned => unreachable,
             error.TargetTooSmall => {}, // handled below
         }
-        const big_int_payload = try scope.arena().create(Value.Payload.IntBigNegative);
-        big_int_payload.* = .{ .limbs = big_int.limbs };
-        break :blk &big_int_payload.base;
-    };
-
-    return self.constInst(scope, src, .{
-        .ty = ty,
-        .val = Value.initPayload(val_payload),
-    });
+        return self.constInst(scope, src, .{
+            .ty = ty,
+            .val = try Value.Tag.int_big_negative.create(scope.arena(), big_int.limbs),
+        });
+    }
 }
 
 pub fn createAnonymousDecl(
@@ -2305,26 +2335,20 @@ pub fn analyzeDeclRef(self: *Module, scope: *Scope, src: usize, decl: *Decl) Inn
     if (decl_tv.val.tag() == .variable) {
         return self.analyzeVarRef(scope, src, decl_tv);
     }
-    const ty = try self.simplePtrType(scope, src, decl_tv.ty, false, .One);
-    const val_payload = try scope.arena().create(Value.Payload.DeclRef);
-    val_payload.* = .{ .decl = decl };
-
     return self.constInst(scope, src, .{
-        .ty = ty,
-        .val = Value.initPayload(&val_payload.base),
+        .ty = try self.simplePtrType(scope, src, decl_tv.ty, false, .One),
+        .val = try Value.Tag.decl_ref.create(scope.arena(), decl),
     });
 }
 
 fn analyzeVarRef(self: *Module, scope: *Scope, src: usize, tv: TypedValue) InnerError!*Inst {
-    const variable = tv.val.cast(Value.Payload.Variable).?.variable;
+    const variable = tv.val.castTag(.variable).?.data;
 
     const ty = try self.simplePtrType(scope, src, tv.ty, variable.is_mutable, .One);
     if (!variable.is_mutable and !variable.is_extern) {
-        const val_payload = try scope.arena().create(Value.Payload.RefVal);
-        val_payload.* = .{ .val = variable.init };
         return self.constInst(scope, src, .{
             .ty = ty,
-            .val = Value.initPayload(&val_payload.base),
+            .val = try Value.Tag.ref_val.create(scope.arena(), variable.init),
         });
     }
 
@@ -2487,12 +2511,11 @@ pub fn analyzeImport(self: *Module, scope: *Scope, src: usize, target_string: []
     }
 
     // TODO Scope.Container arena for ty and sub_file_path
-    const struct_payload = try self.gpa.create(Type.Payload.EmptyStruct);
-    errdefer self.gpa.destroy(struct_payload);
     const file_scope = try self.gpa.create(Scope.File);
     errdefer self.gpa.destroy(file_scope);
+    const struct_ty = try Type.Tag.empty_struct.create(self.gpa, &file_scope.root_container);
+    errdefer self.gpa.destroy(struct_ty.castTag(.empty_struct).?);
 
-    struct_payload.* = .{ .scope = &file_scope.root_container };
     file_scope.* = .{
         .sub_file_path = resolved_path,
         .source = .{ .unloaded = {} },
@@ -2502,7 +2525,7 @@ pub fn analyzeImport(self: *Module, scope: *Scope, src: usize, target_string: []
         .root_container = .{
             .file_scope = file_scope,
             .decls = .{},
-            .ty = Type.initPayload(&struct_payload.base),
+            .ty = struct_ty,
         },
     };
     self.analyzeContainer(&file_scope.root_container) catch |err| switch (err) {
@@ -2523,7 +2546,7 @@ pub fn cmpNumeric(
     lhs: *Inst,
     rhs: *Inst,
     op: std.math.CompareOperator,
-) !*Inst {
+) InnerError!*Inst {
     assert(lhs.ty.isNumeric());
     assert(rhs.ty.isNumeric());
 
@@ -2697,15 +2720,14 @@ fn wrapOptional(self: *Module, scope: *Scope, dest_type: Type, inst: *Inst) !*In
 }
 
 fn makeIntType(self: *Module, scope: *Scope, signed: bool, bits: u16) !Type {
-    if (signed) {
-        const int_payload = try scope.arena().create(Type.Payload.IntSigned);
-        int_payload.* = .{ .bits = bits };
-        return Type.initPayload(&int_payload.base);
-    } else {
-        const int_payload = try scope.arena().create(Type.Payload.IntUnsigned);
-        int_payload.* = .{ .bits = bits };
-        return Type.initPayload(&int_payload.base);
-    }
+    const int_payload = try scope.arena().create(Type.Payload.Bits);
+    int_payload.* = .{
+        .base = .{
+            .tag = if (signed) .int_signed else .int_unsigned,
+        },
+        .data = bits,
+    };
+    return Type.initPayload(&int_payload.base);
 }
 
 pub fn resolvePeerTypes(self: *Module, scope: *Scope, instructions: []*Inst) !Type {
@@ -2788,7 +2810,7 @@ pub fn coerce(self: *Module, scope: *Scope, dest_type: Type, inst: *Inst) !*Inst
 
     // T to ?T
     if (dest_type.zigTypeTag() == .Optional) {
-        var buf: Type.Payload.PointerSimple = undefined;
+        var buf: Type.Payload.ElemType = undefined;
         const child_type = dest_type.optionalChild(&buf);
         if (child_type.eql(inst.ty)) {
             return self.wrapOptional(scope, dest_type, inst);
@@ -2797,16 +2819,47 @@ pub fn coerce(self: *Module, scope: *Scope, dest_type: Type, inst: *Inst) !*Inst
         }
     }
 
-    // *[N]T to []T
-    if (inst.ty.isSinglePointer() and dest_type.isSlice() and
-        (!inst.ty.isConstPtr() or dest_type.isConstPtr()))
-    {
+    // Coercions where the source is a single pointer to an array.
+    src_array_ptr: {
+        if (!inst.ty.isSinglePointer()) break :src_array_ptr;
         const array_type = inst.ty.elemType();
+        if (array_type.zigTypeTag() != .Array) break :src_array_ptr;
+        const array_elem_type = array_type.elemType();
+        if (inst.ty.isConstPtr() and !dest_type.isConstPtr()) break :src_array_ptr;
+        if (inst.ty.isVolatilePtr() and !dest_type.isVolatilePtr()) break :src_array_ptr;
+
         const dst_elem_type = dest_type.elemType();
-        if (array_type.zigTypeTag() == .Array and
-            coerceInMemoryAllowed(dst_elem_type, array_type.elemType()) == .ok)
-        {
-            return self.coerceArrayPtrToSlice(scope, dest_type, inst);
+        switch (coerceInMemoryAllowed(dst_elem_type, array_elem_type)) {
+            .ok => {},
+            .no_match => break :src_array_ptr,
+        }
+
+        switch (dest_type.ptrSize()) {
+            .Slice => {
+                // *[N]T to []T
+                return self.coerceArrayPtrToSlice(scope, dest_type, inst);
+            },
+            .C => {
+                // *[N]T to [*c]T
+                return self.coerceArrayPtrToMany(scope, dest_type, inst);
+            },
+            .Many => {
+                // *[N]T to [*]T
+                // *[N:s]T to [*:s]T
+                const src_sentinel = array_type.sentinel();
+                const dst_sentinel = dest_type.sentinel();
+                if (src_sentinel == null and dst_sentinel == null)
+                    return self.coerceArrayPtrToMany(scope, dest_type, inst);
+
+                if (src_sentinel) |src_s| {
+                    if (dst_sentinel) |dst_s| {
+                        if (src_s.eql(dst_s)) {
+                            return self.coerceArrayPtrToMany(scope, dest_type, inst);
+                        }
+                    }
+                }
+            },
+            .One => {},
         }
     }
 
@@ -2912,6 +2965,14 @@ fn coerceArrayPtrToSlice(self: *Module, scope: *Scope, dest_type: Type, inst: *I
         return self.constInst(scope, inst.src, .{ .ty = dest_type, .val = val });
     }
     return self.fail(scope, inst.src, "TODO implement coerceArrayPtrToSlice runtime instruction", .{});
+}
+
+fn coerceArrayPtrToMany(self: *Module, scope: *Scope, dest_type: Type, inst: *Inst) !*Inst {
+    if (inst.value()) |val| {
+        // The comptime Value representation is compatible with both types.
+        return self.constInst(scope, inst.src, .{ .ty = dest_type, .val = val });
+    }
+    return self.fail(scope, inst.src, "TODO implement coerceArrayPtrToMany runtime instruction", .{});
 }
 
 pub fn fail(self: *Module, scope: *Scope, src: usize, comptime format: []const u8, args: anytype) InnerError {
@@ -3029,17 +3090,11 @@ pub fn intAdd(allocator: *Allocator, lhs: Value, rhs: Value) !Value {
     result_bigint.add(lhs_bigint, rhs_bigint);
     const result_limbs = result_bigint.limbs[0..result_bigint.len];
 
-    const val_payload = if (result_bigint.positive) blk: {
-        const val_payload = try allocator.create(Value.Payload.IntBigPositive);
-        val_payload.* = .{ .limbs = result_limbs };
-        break :blk &val_payload.base;
-    } else blk: {
-        const val_payload = try allocator.create(Value.Payload.IntBigNegative);
-        val_payload.* = .{ .limbs = result_limbs };
-        break :blk &val_payload.base;
-    };
-
-    return Value.initPayload(val_payload);
+    if (result_bigint.positive) {
+        return Value.Tag.int_big_positive.create(allocator, result_limbs);
+    } else {
+        return Value.Tag.int_big_negative.create(allocator, result_limbs);
+    }
 }
 
 pub fn intSub(allocator: *Allocator, lhs: Value, rhs: Value) !Value {
@@ -3057,95 +3112,98 @@ pub fn intSub(allocator: *Allocator, lhs: Value, rhs: Value) !Value {
     result_bigint.sub(lhs_bigint, rhs_bigint);
     const result_limbs = result_bigint.limbs[0..result_bigint.len];
 
-    const val_payload = if (result_bigint.positive) blk: {
-        const val_payload = try allocator.create(Value.Payload.IntBigPositive);
-        val_payload.* = .{ .limbs = result_limbs };
-        break :blk &val_payload.base;
-    } else blk: {
-        const val_payload = try allocator.create(Value.Payload.IntBigNegative);
-        val_payload.* = .{ .limbs = result_limbs };
-        break :blk &val_payload.base;
-    };
-
-    return Value.initPayload(val_payload);
+    if (result_bigint.positive) {
+        return Value.Tag.int_big_positive.create(allocator, result_limbs);
+    } else {
+        return Value.Tag.int_big_negative.create(allocator, result_limbs);
+    }
 }
 
-pub fn floatAdd(self: *Module, scope: *Scope, float_type: Type, src: usize, lhs: Value, rhs: Value) !Value {
-    var bit_count = switch (float_type.tag()) {
-        .comptime_float => 128,
-        else => float_type.floatBits(self.getTarget()),
-    };
-
-    const allocator = scope.arena();
-    const val_payload = switch (bit_count) {
-        16 => {
-            return self.fail(scope, src, "TODO Implement addition for soft floats", .{});
+pub fn floatAdd(
+    self: *Module,
+    scope: *Scope,
+    float_type: Type,
+    src: usize,
+    lhs: Value,
+    rhs: Value,
+) !Value {
+    const arena = scope.arena();
+    switch (float_type.tag()) {
+        .f16 => {
+            @panic("TODO add __trunctfhf2 to compiler-rt");
+            //const lhs_val = lhs.toFloat(f16);
+            //const rhs_val = rhs.toFloat(f16);
+            //return Value.Tag.float_16.create(arena, lhs_val + rhs_val);
         },
-        32 => blk: {
+        .f32 => {
             const lhs_val = lhs.toFloat(f32);
             const rhs_val = rhs.toFloat(f32);
-            const val_payload = try allocator.create(Value.Payload.Float_32);
-            val_payload.* = .{ .val = lhs_val + rhs_val };
-            break :blk &val_payload.base;
+            return Value.Tag.float_32.create(arena, lhs_val + rhs_val);
         },
-        64 => blk: {
+        .f64 => {
             const lhs_val = lhs.toFloat(f64);
             const rhs_val = rhs.toFloat(f64);
-            const val_payload = try allocator.create(Value.Payload.Float_64);
-            val_payload.* = .{ .val = lhs_val + rhs_val };
-            break :blk &val_payload.base;
+            return Value.Tag.float_64.create(arena, lhs_val + rhs_val);
         },
-        128 => {
-            return self.fail(scope, src, "TODO Implement addition for big floats", .{});
+        .f128, .comptime_float, .c_longdouble => {
+            const lhs_val = lhs.toFloat(f128);
+            const rhs_val = rhs.toFloat(f128);
+            return Value.Tag.float_128.create(arena, lhs_val + rhs_val);
         },
         else => unreachable,
-    };
-
-    return Value.initPayload(val_payload);
+    }
 }
 
-pub fn floatSub(self: *Module, scope: *Scope, float_type: Type, src: usize, lhs: Value, rhs: Value) !Value {
-    var bit_count = switch (float_type.tag()) {
-        .comptime_float => 128,
-        else => float_type.floatBits(self.getTarget()),
-    };
-
-    const allocator = scope.arena();
-    const val_payload = switch (bit_count) {
-        16 => {
-            return self.fail(scope, src, "TODO Implement substraction for soft floats", .{});
+pub fn floatSub(
+    self: *Module,
+    scope: *Scope,
+    float_type: Type,
+    src: usize,
+    lhs: Value,
+    rhs: Value,
+) !Value {
+    const arena = scope.arena();
+    switch (float_type.tag()) {
+        .f16 => {
+            @panic("TODO add __trunctfhf2 to compiler-rt");
+            //const lhs_val = lhs.toFloat(f16);
+            //const rhs_val = rhs.toFloat(f16);
+            //return Value.Tag.float_16.create(arena, lhs_val - rhs_val);
         },
-        32 => blk: {
+        .f32 => {
             const lhs_val = lhs.toFloat(f32);
             const rhs_val = rhs.toFloat(f32);
-            const val_payload = try allocator.create(Value.Payload.Float_32);
-            val_payload.* = .{ .val = lhs_val - rhs_val };
-            break :blk &val_payload.base;
+            return Value.Tag.float_32.create(arena, lhs_val - rhs_val);
         },
-        64 => blk: {
+        .f64 => {
             const lhs_val = lhs.toFloat(f64);
             const rhs_val = rhs.toFloat(f64);
-            const val_payload = try allocator.create(Value.Payload.Float_64);
-            val_payload.* = .{ .val = lhs_val - rhs_val };
-            break :blk &val_payload.base;
+            return Value.Tag.float_64.create(arena, lhs_val - rhs_val);
         },
-        128 => {
-            return self.fail(scope, src, "TODO Implement substraction for big floats", .{});
+        .f128, .comptime_float, .c_longdouble => {
+            const lhs_val = lhs.toFloat(f128);
+            const rhs_val = rhs.toFloat(f128);
+            return Value.Tag.float_128.create(arena, lhs_val - rhs_val);
         },
         else => unreachable,
-    };
-
-    return Value.initPayload(val_payload);
+    }
 }
 
-pub fn simplePtrType(self: *Module, scope: *Scope, src: usize, elem_ty: Type, mutable: bool, size: std.builtin.TypeInfo.Pointer.Size) Allocator.Error!Type {
+pub fn simplePtrType(
+    self: *Module,
+    scope: *Scope,
+    src: usize,
+    elem_ty: Type,
+    mutable: bool,
+    size: std.builtin.TypeInfo.Pointer.Size,
+) Allocator.Error!Type {
     if (!mutable and size == .Slice and elem_ty.eql(Type.initTag(.u8))) {
         return Type.initTag(.const_slice_u8);
     }
     // TODO stage1 type inference bug
     const T = Type.Tag;
 
-    const type_payload = try scope.arena().create(Type.Payload.PointerSimple);
+    const type_payload = try scope.arena().create(Type.Payload.ElemType);
     type_payload.* = .{
         .base = .{
             .tag = switch (size) {
@@ -3155,7 +3213,7 @@ pub fn simplePtrType(self: *Module, scope: *Scope, src: usize, elem_ty: Type, mu
                 .Slice => if (mutable) T.mut_slice else T.const_slice,
             },
         },
-        .pointee_type = elem_ty,
+        .data = elem_ty,
     };
     return Type.initPayload(&type_payload.base);
 }
@@ -3177,8 +3235,7 @@ pub fn ptrType(
     assert(host_size == 0 or bit_offset < host_size * 8);
 
     // TODO check if type can be represented by simplePtrType
-    const type_payload = try scope.arena().create(Type.Payload.Pointer);
-    type_payload.* = .{
+    return Type.Tag.pointer.create(scope.arena(), .{
         .pointee_type = elem_ty,
         .sentinel = sentinel,
         .@"align" = @"align",
@@ -3188,95 +3245,73 @@ pub fn ptrType(
         .mutable = mutable,
         .@"volatile" = @"volatile",
         .size = size,
-    };
-    return Type.initPayload(&type_payload.base);
-}
-
-pub fn optionalType(self: *Module, scope: *Scope, child_type: Type) Allocator.Error!Type {
-    return Type.initPayload(switch (child_type.tag()) {
-        .single_const_pointer => blk: {
-            const payload = try scope.arena().create(Type.Payload.PointerSimple);
-            payload.* = .{
-                .base = .{ .tag = .optional_single_const_pointer },
-                .pointee_type = child_type.elemType(),
-            };
-            break :blk &payload.base;
-        },
-        .single_mut_pointer => blk: {
-            const payload = try scope.arena().create(Type.Payload.PointerSimple);
-            payload.* = .{
-                .base = .{ .tag = .optional_single_mut_pointer },
-                .pointee_type = child_type.elemType(),
-            };
-            break :blk &payload.base;
-        },
-        else => blk: {
-            const payload = try scope.arena().create(Type.Payload.Optional);
-            payload.* = .{
-                .child_type = child_type,
-            };
-            break :blk &payload.base;
-        },
     });
 }
 
-pub fn arrayType(self: *Module, scope: *Scope, len: u64, sentinel: ?Value, elem_type: Type) Allocator.Error!Type {
+pub fn optionalType(self: *Module, scope: *Scope, child_type: Type) Allocator.Error!Type {
+    switch (child_type.tag()) {
+        .single_const_pointer => return Type.Tag.optional_single_const_pointer.create(
+            scope.arena(),
+            child_type.elemType(),
+        ),
+        .single_mut_pointer => return Type.Tag.optional_single_mut_pointer.create(
+            scope.arena(),
+            child_type.elemType(),
+        ),
+        else => return Type.Tag.optional.create(scope.arena(), child_type),
+    }
+}
+
+pub fn arrayType(
+    self: *Module,
+    scope: *Scope,
+    len: u64,
+    sentinel: ?Value,
+    elem_type: Type,
+) Allocator.Error!Type {
     if (elem_type.eql(Type.initTag(.u8))) {
         if (sentinel) |some| {
             if (some.eql(Value.initTag(.zero))) {
-                const payload = try scope.arena().create(Type.Payload.Array_u8_Sentinel0);
-                payload.* = .{
-                    .len = len,
-                };
-                return Type.initPayload(&payload.base);
+                return Type.Tag.array_u8_sentinel_0.create(scope.arena(), len);
             }
         } else {
-            const payload = try scope.arena().create(Type.Payload.Array_u8);
-            payload.* = .{
-                .len = len,
-            };
-            return Type.initPayload(&payload.base);
+            return Type.Tag.array_u8.create(scope.arena(), len);
         }
     }
 
     if (sentinel) |some| {
-        const payload = try scope.arena().create(Type.Payload.ArraySentinel);
-        payload.* = .{
+        return Type.Tag.array_sentinel.create(scope.arena(), .{
             .len = len,
             .sentinel = some,
             .elem_type = elem_type,
-        };
-        return Type.initPayload(&payload.base);
+        });
     }
 
-    const payload = try scope.arena().create(Type.Payload.Array);
-    payload.* = .{
+    return Type.Tag.array.create(scope.arena(), .{
         .len = len,
         .elem_type = elem_type,
-    };
-    return Type.initPayload(&payload.base);
+    });
 }
 
-pub fn errorUnionType(self: *Module, scope: *Scope, error_set: Type, payload: Type) Allocator.Error!Type {
+pub fn errorUnionType(
+    self: *Module,
+    scope: *Scope,
+    error_set: Type,
+    payload: Type,
+) Allocator.Error!Type {
     assert(error_set.zigTypeTag() == .ErrorSet);
     if (error_set.eql(Type.initTag(.anyerror)) and payload.eql(Type.initTag(.void))) {
         return Type.initTag(.anyerror_void_error_union);
     }
 
-    const result = try scope.arena().create(Type.Payload.ErrorUnion);
-    result.* = .{
+    return Type.Tag.error_union.create(scope.arena(), .{
         .error_set = error_set,
         .payload = payload,
-    };
-    return Type.initPayload(&result.base);
+    });
 }
 
 pub fn anyframeType(self: *Module, scope: *Scope, return_type: Type) Allocator.Error!Type {
-    const result = try scope.arena().create(Type.Payload.AnyFrame);
-    result.* = .{
-        .return_type = return_type,
-    };
-    return Type.initPayload(&result.base);
+    return Type.Tag.anyframe_T.create(scope.arena(), return_type);
 }
 
 pub fn dumpInst(self: *Module, scope: *Scope, inst: *Inst) void {
@@ -3385,4 +3420,10 @@ pub fn getTarget(self: Module) Target {
 
 pub fn optimizeMode(self: Module) std.builtin.Mode {
     return self.comp.bin_file.options.optimize_mode;
+}
+
+pub fn validateVarType(mod: *Module, scope: *Scope, src: usize, ty: Type) !void {
+    if (!ty.isValidVarType(false)) {
+        return mod.fail(scope, src, "variable of type '{}' must be const or comptime", .{ty});
+    }
 }

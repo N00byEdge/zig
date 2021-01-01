@@ -168,6 +168,9 @@ pub fn build(b: *Builder) !void {
             } else if (exe.target.isFreeBSD()) {
                 try addCxxKnownPath(b, cfg, exe, "libc++.a", null, need_cpp_includes);
                 exe.linkSystemLibrary("pthread");
+            } else if (exe.target.getOsTag() == .openbsd) {
+                try addCxxKnownPath(b, cfg, exe, "libc++.a", null, need_cpp_includes);
+                try addCxxKnownPath(b, cfg, exe, "libc++abi.a", null, need_cpp_includes);
             } else if (exe.target.isDarwin()) {
                 if (addCxxKnownPath(b, cfg, exe, "libgcc_eh.a", "", need_cpp_includes)) {
                     // Compiler is GCC.
@@ -231,18 +234,6 @@ pub fn build(b: *Builder) !void {
             break :v version_string;
         };
         const git_sha_trimmed = mem.trim(u8, git_sha_untrimmed, " \n\r");
-        // Detect dirty changes.
-        const diff_untrimmed = b.execAllowFail(&[_][]const u8{
-            "git", "-C", b.build_root, "diff", "HEAD",
-        }, &code, .Ignore) catch |err| {
-            std.debug.print("Error executing git diff: {}", .{err});
-            std.process.exit(1);
-        };
-        const trimmed_diff = mem.trim(u8, diff_untrimmed, " \n\r");
-        const dirty_suffix = if (trimmed_diff.len == 0) "" else s: {
-            const dirty_hash = std.hash.Wyhash.hash(0, trimmed_diff);
-            break :s b.fmt("dirty{x}", .{@truncate(u32, dirty_hash)});
-        };
 
         // This will look like e.g. "0.7.0^0" for a tag commit.
         if (mem.endsWith(u8, git_sha_trimmed, "^0")) {
@@ -251,9 +242,9 @@ pub fn build(b: *Builder) !void {
                 std.debug.print("Expected git tag '{}', found '{}'\n", .{ version_string, git_ver_string });
                 std.process.exit(1);
             }
-            break :v b.fmt("{}{}", .{ version_string, dirty_suffix });
+            break :v b.fmt("{}", .{version_string});
         } else {
-            break :v b.fmt("{}+{}{}", .{ version_string, git_sha_trimmed, dirty_suffix });
+            break :v b.fmt("{}+{}", .{ version_string, git_sha_trimmed });
         }
     };
     exe.addBuildOption([:0]const u8, "version", try b.allocator.dupeZ(u8, version));

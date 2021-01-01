@@ -13,15 +13,40 @@ const C = @This();
 
 pub const base_tag: File.Tag = .c;
 
+pub const Header = struct {
+    buf: std.ArrayList(u8),
+    emit_loc: ?Compilation.EmitLoc,
+
+    pub fn init(allocator: *Allocator, emit_loc: ?Compilation.EmitLoc) Header {
+        return .{
+            .buf = std.ArrayList(u8).init(allocator),
+            .emit_loc = emit_loc,
+        };
+    }
+
+    pub fn flush(self: *const Header, writer: anytype) !void {
+        const tracy = trace(@src());
+        defer tracy.end();
+
+        try writer.writeAll(@embedFile("cbe.h"));
+        if (self.buf.items.len > 0) {
+            try writer.print("{s}", .{self.buf.items});
+        }
+    }
+
+    pub fn deinit(self: *Header) void {
+        self.buf.deinit();
+        self.* = undefined;
+    }
+};
+
 base: File,
 
-header: std.ArrayList(u8),
+header: Header,
 constants: std.ArrayList(u8),
 main: std.ArrayList(u8),
 
 called: std.StringHashMap(void),
-need_stddef: bool = false,
-need_stdint: bool = false,
 error_msg: *Compilation.ErrorMsg = undefined,
 
 pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Options) !*C {
@@ -44,7 +69,7 @@ pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Optio
             .allocator = allocator,
         },
         .main = std.ArrayList(u8).init(allocator),
-        .header = std.ArrayList(u8).init(allocator),
+        .header = Header.init(allocator, null),
         .constants = std.ArrayList(u8).init(allocator),
         .called = std.StringHashMap(void).init(allocator),
     };
@@ -65,7 +90,7 @@ pub fn deinit(self: *C) void {
 }
 
 pub fn updateDecl(self: *C, module: *Module, decl: *Module.Decl) !void {
-    codegen.generate(self, decl) catch |err| {
+    codegen.generate(self, module, decl) catch |err| {
         if (err == error.AnalysisFail) {
             try module.failed_decls.put(module.gpa, decl, self.error_msg);
         }
@@ -82,21 +107,9 @@ pub fn flushModule(self: *C, comp: *Compilation) !void {
     defer tracy.end();
 
     const writer = self.base.file.?.writer();
-    try writer.writeAll(@embedFile("cbe.h"));
-    var includes = false;
-    if (self.need_stddef) {
-        try writer.writeAll("#include <stddef.h>\n");
-        includes = true;
-    }
-    if (self.need_stdint) {
-        try writer.writeAll("#include <stdint.h>\n");
-        includes = true;
-    }
-    if (includes) {
+    try self.header.flush(writer);
+    if (self.header.buf.items.len > 0) {
         try writer.writeByte('\n');
-    }
-    if (self.header.items.len > 0) {
-        try writer.print("{}\n", .{self.header.items});
     }
     if (self.constants.items.len > 0) {
         try writer.print("{}\n", .{self.constants.items});

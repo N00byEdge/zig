@@ -75,12 +75,13 @@ pub const Options = struct {
     pic: bool,
     pie: bool,
     valgrind: bool,
+    tsan: bool,
     stack_check: bool,
     single_threaded: bool,
     verbose_link: bool,
     dll_export_fns: bool,
     error_return_tracing: bool,
-    is_compiler_rt_or_libc: bool,
+    skip_linker_dependencies: bool,
     parent_compilation_link_libc: bool,
     each_lib_rpath: bool,
     disable_lld_caching: bool,
@@ -566,7 +567,7 @@ pub const File = struct {
             std.debug.print("\n", .{});
         }
 
-        const llvm = @import("llvm.zig");
+        const llvm = @import("llvm_bindings.zig");
         const os_type = @import("target.zig").osToLLVM(base.options.target.os.tag);
         const bad = llvm.WriteArchive(full_out_path_z, object_files.items.ptr, object_files.items.len, os_type);
         if (bad) return error.UnableToWriteArchive;

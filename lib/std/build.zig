@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -509,7 +509,26 @@ pub const Builder = struct {
                     return null;
                 },
             },
-            .Float => panic("TODO float options to build script", .{}),
+            .Float => switch (entry.value.value) {
+                .Flag => {
+                    warn("Expected -D{} to be a float, but received a boolean.\n", .{name});
+                    self.markInvalidUserInput();
+                    return null;
+                },
+                .Scalar => |s| {
+                    const n = std.fmt.parseFloat(T, s) catch |err| {
+                        warn("Expected -D{} to be a float of type {}.\n", .{ name, @typeName(T) });
+                        self.markInvalidUserInput();
+                        return null;
+                    };
+                    return n;
+                },
+                .List => {
+                    warn("Expected -D{} to be a float, but received a list.\n", .{name});
+                    self.markInvalidUserInput();
+                    return null;
+                },
+            },
             .Enum => switch (entry.value.value) {
                 .Flag => {
                     warn("Expected -D{} to be a string, but received a boolean.\n", .{name});
@@ -1233,6 +1252,7 @@ pub const LibExeObjStep = struct {
     bundle_compiler_rt: ?bool = null,
     disable_stack_probing: bool,
     disable_sanitize_c: bool,
+    sanitize_thread: bool,
     rdynamic: bool,
     c_std: Builder.CStd,
     override_lib_dir: ?[]const u8,
@@ -1415,6 +1435,7 @@ pub const LibExeObjStep = struct {
             .filter = null,
             .disable_stack_probing = false,
             .disable_sanitize_c = false,
+            .sanitize_thread = false,
             .rdynamic = false,
             .output_dir = null,
             .single_threaded = false,
@@ -2232,6 +2253,9 @@ pub const LibExeObjStep = struct {
         }
         if (self.disable_sanitize_c) {
             try zig_args.append("-fno-sanitize-c");
+        }
+        if (self.sanitize_thread) {
+            try zig_args.append("-fsanitize-thread");
         }
         if (self.rdynamic) {
             try zig_args.append("-rdynamic");

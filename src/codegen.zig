@@ -137,7 +137,7 @@ pub fn generateSymbol(
         },
         .Array => {
             // TODO populate .debug_info for the array
-            if (typed_value.val.cast(Value.Payload.Bytes)) |payload| {
+            if (typed_value.val.castTag(.bytes)) |payload| {
                 if (typed_value.ty.sentinel()) |sentinel| {
                     try code.ensureCapacity(code.items.len + payload.data.len + 1);
                     code.appendSliceAssumeCapacity(payload.data);
@@ -168,8 +168,8 @@ pub fn generateSymbol(
         },
         .Pointer => {
             // TODO populate .debug_info for the pointer
-            if (typed_value.val.cast(Value.Payload.DeclRef)) |payload| {
-                const decl = payload.decl;
+            if (typed_value.val.castTag(.decl_ref)) |payload| {
+                const decl = payload.data;
                 if (decl.analysis != .complete) return error.AnalysisFail;
                 // TODO handle the dependency of this symbol on the decl's vaddr.
                 // If the decl changes vaddr, then this symbol needs to get regenerated.
@@ -432,7 +432,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 @panic("Attempted to compile for architecture that was disabled by build configuration");
             }
 
-            const module_fn = typed_value.val.cast(Value.Payload.Function).?.func;
+            const module_fn = typed_value.val.castTag(.function).?.data;
 
             const fn_type = module_fn.owner_decl.typed_value.most_recent.typed_value.ty;
 
@@ -764,6 +764,8 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 .arg => return self.genArg(inst.castTag(.arg).?),
                 .assembly => return self.genAsm(inst.castTag(.assembly).?),
                 .bitcast => return self.genBitCast(inst.castTag(.bitcast).?),
+                .bitand => return self.genBitAnd(inst.castTag(.bitand).?),
+                .bitor => return self.genBitOr(inst.castTag(.bitor).?),
                 .block => return self.genBlock(inst.castTag(.block).?),
                 .br => return self.genBr(inst.castTag(.br).?),
                 .breakpoint => return self.genBreakpoint(inst.src),
@@ -799,6 +801,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 .unwrap_optional => return self.genUnwrapOptional(inst.castTag(.unwrap_optional).?),
                 .wrap_optional => return self.genWrapOptional(inst.castTag(.wrap_optional).?),
                 .varptr => return self.genVarPtr(inst.castTag(.varptr).?),
+                .xor => return self.genXor(inst.castTag(.xor).?),
             }
         }
 
@@ -1006,6 +1009,36 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 },
                 .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .add),
                 else => return self.fail(inst.base.src, "TODO implement add for {}", .{self.target.cpu.arch}),
+            }
+        }
+
+        fn genBitAnd(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
+            // No side effects, so if it's unreferenced, do nothing.
+            if (inst.base.isUnused())
+                return MCValue.dead;
+            switch (arch) {
+                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .bitand),
+                else => return self.fail(inst.base.src, "TODO implement bitwise and for {}", .{self.target.cpu.arch}),
+            }
+        }
+
+        fn genBitOr(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
+            // No side effects, so if it's unreferenced, do nothing.
+            if (inst.base.isUnused())
+                return MCValue.dead;
+            switch (arch) {
+                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .bitor),
+                else => return self.fail(inst.base.src, "TODO implement bitwise or for {}", .{self.target.cpu.arch}),
+            }
+        }
+
+        fn genXor(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
+            // No side effects, so if it's unreferenced, do nothing.
+            if (inst.base.isUnused())
+                return MCValue.dead;
+            switch (arch) {
+                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .xor),
+                else => return self.fail(inst.base.src, "TODO implement xor for {}", .{self.target.cpu.arch}),
             }
         }
 
@@ -1251,13 +1284,13 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         writeInt(u32, try self.code.addManyAsArray(4), Instruction.rsb(.al, dst_reg, dst_reg, operand).toU32());
                     }
                 },
-                .booland => {
+                .booland, .bitand => {
                     writeInt(u32, try self.code.addManyAsArray(4), Instruction.@"and"(.al, dst_reg, dst_reg, operand).toU32());
                 },
-                .boolor => {
+                .boolor, .bitor => {
                     writeInt(u32, try self.code.addManyAsArray(4), Instruction.orr(.al, dst_reg, dst_reg, operand).toU32());
                 },
-                .not => {
+                .not, .xor => {
                     writeInt(u32, try self.code.addManyAsArray(4), Instruction.eor(.al, dst_reg, dst_reg, operand).toU32());
                 },
                 else => unreachable, // not a binary instruction
@@ -1546,9 +1579,9 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                             }
                         }
 
-                        if (inst.func.cast(ir.Inst.Constant)) |func_inst| {
-                            if (func_inst.val.cast(Value.Payload.Function)) |func_val| {
-                                const func = func_val.func;
+                        if (inst.func.value()) |func_value| {
+                            if (func_value.castTag(.function)) |func_payload| {
+                                const func = func_payload.data;
 
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
@@ -1574,9 +1607,9 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                     .riscv64 => {
                         if (info.args.len > 0) return self.fail(inst.base.src, "TODO implement fn args for {}", .{self.target.cpu.arch});
 
-                        if (inst.func.cast(ir.Inst.Constant)) |func_inst| {
-                            if (func_inst.val.cast(Value.Payload.Function)) |func_val| {
-                                const func = func_val.func;
+                        if (inst.func.value()) |func_value| {
+                            if (func_value.castTag(.function)) |func_payload| {
+                                const func = func_payload.data;
 
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
@@ -1598,12 +1631,12 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         }
                     },
                     .spu_2 => {
-                        if (inst.func.cast(ir.Inst.Constant)) |func_inst| {
+                        if (inst.func.value()) |func_value| {
                             if (info.args.len != 0) {
                                 return self.fail(inst.base.src, "TODO implement call with more than 0 parameters", .{});
                             }
-                            if (func_inst.val.cast(Value.Payload.Function)) |func_val| {
-                                const func = func_val.func;
+                            if (func_value.castTag(.function)) |func_payload| {
+                                const func = func_payload.data;
                                 const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
                                     const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
                                     break :blk @intCast(u16, got.p_vaddr + func.owner_decl.link.elf.offset_table_index * 2);
@@ -1672,9 +1705,9 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                             }
                         }
 
-                        if (inst.func.cast(ir.Inst.Constant)) |func_inst| {
-                            if (func_inst.val.cast(Value.Payload.Function)) |func_val| {
-                                const func = func_val.func;
+                        if (inst.func.value()) |func_value| {
+                            if (func_value.castTag(.function)) |func_payload| {
+                                const func = func_payload.data;
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
                                 const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
@@ -1733,9 +1766,9 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                             }
                         }
 
-                        if (inst.func.cast(ir.Inst.Constant)) |func_inst| {
-                            if (func_inst.val.cast(Value.Payload.Function)) |func_val| {
-                                const func = func_val.func;
+                        if (inst.func.value()) |func_value| {
+                            if (func_value.castTag(.function)) |func_payload| {
+                                const func = func_payload.data;
                                 const ptr_bits = self.target.cpu.arch.ptrBitWidth();
                                 const ptr_bytes: u64 = @divExact(ptr_bits, 8);
                                 const got_addr = if (self.bin_file.cast(link.File.Elf)) |elf_file| blk: {
@@ -1792,9 +1825,9 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                     }
                 }
 
-                if (inst.func.cast(ir.Inst.Constant)) |func_inst| {
-                    if (func_inst.val.cast(Value.Payload.Function)) |func_val| {
-                        const func = func_val.func;
+                if (inst.func.value()) |func_value| {
+                    if (func_value.castTag(.function)) |func_payload| {
+                        const func = func_payload.data;
                         const text_segment = &macho_file.load_commands.items[macho_file.text_segment_cmd_index.?].Segment;
                         const got = &text_segment.sections.items[macho_file.got_section_index.?];
                         const got_addr = got.addr + func.owner_decl.link.macho.offset_table_index * @sizeOf(u64);
@@ -3190,20 +3223,20 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             const ptr_bytes: u64 = @divExact(ptr_bits, 8);
             switch (typed_value.ty.zigTypeTag()) {
                 .Pointer => {
-                    if (typed_value.val.cast(Value.Payload.DeclRef)) |payload| {
+                    if (typed_value.val.castTag(.decl_ref)) |payload| {
                         if (self.bin_file.cast(link.File.Elf)) |elf_file| {
-                            const decl = payload.decl;
+                            const decl = payload.data;
                             const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
                             const got_addr = got.p_vaddr + decl.link.elf.offset_table_index * ptr_bytes;
                             return MCValue{ .memory = got_addr };
                         } else if (self.bin_file.cast(link.File.MachO)) |macho_file| {
-                            const decl = payload.decl;
+                            const decl = payload.data;
                             const text_segment = &macho_file.load_commands.items[macho_file.text_segment_cmd_index.?].Segment;
                             const got = &text_segment.sections.items[macho_file.got_section_index.?];
                             const got_addr = got.addr + decl.link.macho.offset_table_index * ptr_bytes;
                             return MCValue{ .memory = got_addr };
                         } else if (self.bin_file.cast(link.File.Coff)) |coff_file| {
-                            const decl = payload.decl;
+                            const decl = payload.data;
                             const got_addr = coff_file.offset_table_virtual_address + decl.link.coff.offset_table_index * ptr_bytes;
                             return MCValue{ .memory = got_addr };
                         } else {
@@ -3229,7 +3262,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         if (typed_value.val.isNull())
                             return MCValue{ .immediate = 0 };
 
-                        var buf: Type.Payload.PointerSimple = undefined;
+                        var buf: Type.Payload.ElemType = undefined;
                         return self.genTypedValue(src, .{
                             .ty = typed_value.ty.optionalChild(&buf),
                             .val = typed_value.val,

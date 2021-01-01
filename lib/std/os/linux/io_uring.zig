@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -1378,11 +1378,10 @@ test "timeout_remove" {
     // Timeout remove operations set the fd to -1, which results in EBADF before EINVAL.
     // We use IORING_FEAT_RW_CUR_POS as a safety check here to make sure we are at least pre-5.6.
     // We don't want to skip this test for newer kernels.
-    if (
-        cqe_timeout.user_data == 0x99999999 and
+    if (cqe_timeout.user_data == 0x99999999 and
         cqe_timeout.res == -linux.EBADF and
-        (ring.features & linux.IORING_FEAT_RW_CUR_POS) == 0
-    ) {
+        (ring.features & linux.IORING_FEAT_RW_CUR_POS) == 0)
+    {
         return error.SkipZigTest;
     }
     testing.expectEqual(linux.io_uring_cqe{

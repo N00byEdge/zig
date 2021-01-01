@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -1837,6 +1837,39 @@ pub const tcflag_t = u32;
 
 pub const NCCS = 32;
 
+pub const B0 = 0o0000000;
+pub const B50 = 0o0000001;
+pub const B75 = 0o0000002;
+pub const B110 = 0o0000003;
+pub const B134 = 0o0000004;
+pub const B150 = 0o0000005;
+pub const B200 = 0o0000006;
+pub const B300 = 0o0000007;
+pub const B600 = 0o0000010;
+pub const B1200 = 0o0000011;
+pub const B1800 = 0o0000012;
+pub const B2400 = 0o0000013;
+pub const B4800 = 0o0000014;
+pub const B9600 = 0o0000015;
+pub const B19200 = 0o0000016;
+pub const B38400 = 0o0000017;
+pub const BOTHER = 0o0010000;
+pub const B57600 = 0o0010001;
+pub const B115200 = 0o0010002;
+pub const B230400 = 0o0010003;
+pub const B460800 = 0o0010004;
+pub const B500000 = 0o0010005;
+pub const B576000 = 0o0010006;
+pub const B921600 = 0o0010007;
+pub const B1000000 = 0o0010010;
+pub const B1152000 = 0o0010011;
+pub const B1500000 = 0o0010012;
+pub const B2000000 = 0o0010013;
+pub const B2500000 = 0o0010014;
+pub const B3000000 = 0o0010015;
+pub const B3500000 = 0o0010016;
+pub const B4000000 = 0o0010017;
+
 pub const IGNBRK = 1;
 pub const BRKINT = 2;
 pub const IGNPAR = 4;
@@ -2012,3 +2045,25 @@ pub const rlimit = extern struct {
     /// Hard limit
     max: rlim_t,
 };
+
+pub const MADV_NORMAL = 0;
+pub const MADV_RANDOM = 1;
+pub const MADV_SEQUENTIAL = 2;
+pub const MADV_WILLNEED = 3;
+pub const MADV_DONTNEED = 4;
+pub const MADV_FREE = 8;
+pub const MADV_REMOVE = 9;
+pub const MADV_DONTFORK = 10;
+pub const MADV_DOFORK = 11;
+pub const MADV_MERGEABLE = 12;
+pub const MADV_UNMERGEABLE = 13;
+pub const MADV_HUGEPAGE = 14;
+pub const MADV_NOHUGEPAGE = 15;
+pub const MADV_DONTDUMP = 16;
+pub const MADV_DODUMP = 17;
+pub const MADV_WIPEONFORK = 18;
+pub const MADV_KEEPONFORK = 19;
+pub const MADV_COLD = 20;
+pub const MADV_PAGEOUT = 21;
+pub const MADV_HWPOISON = 100;
+pub const MADV_SOFT_OFFLINE = 101;

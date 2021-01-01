@@ -41,8 +41,12 @@ pub const Inst = struct {
         /// Allocates stack local memory. Its lifetime ends when the block ends that contains
         /// this instruction. The operand is the type of the allocated object.
         alloc,
+        /// Same as `alloc` except mutable.
+        alloc_mut,
         /// Same as `alloc` except the type is inferred.
         alloc_inferred,
+        /// Same as `alloc_inferred` except mutable.
+        alloc_inferred_mut,
         /// Create an `anyframe->T`.
         anyframe_type,
         /// Array concatenation. `a ++ b`
@@ -237,12 +241,20 @@ pub const Inst = struct {
         const_slice_type,
         /// Create a pointer type with attributes
         ptr_type,
+        /// Each `store_to_inferred_ptr` puts the type of the stored value into a set,
+        /// and then `resolve_inferred_alloc` triggers peer type resolution on the set.
+        /// The operand is a `alloc_inferred` or `alloc_inferred_mut` instruction, which
+        /// is the allocation that needs to have its type inferred.
+        resolve_inferred_alloc,
         /// Slice operation `array_ptr[start..end:sentinel]`
         slice,
         /// Slice operation with just start `lhs[rhs..]`
         slice_start,
         /// Write a value to a pointer. For loading, see `deref`.
         store,
+        /// Same as `store` but the type of the value being stored will be used to infer
+        /// the pointer type.
+        store_to_inferred_ptr,
         /// String Literal. Makes an anonymous Decl and then takes a pointer to it.
         str,
         /// Arithmetic subtraction. Asserts no integer overflow.
@@ -251,6 +263,8 @@ pub const Inst = struct {
         subwrap,
         /// Returns the type of a value.
         typeof,
+        /// Is the builtin @TypeOf which returns the type after peertype resolution of one or more params
+        typeof_peer,
         /// Asserts control-flow will not reach this instruction. Not safety checked - the compiler
         /// will assume the correctness of this instruction.
         unreach_nocheck,
@@ -285,24 +299,27 @@ pub const Inst = struct {
 
         pub fn Type(tag: Tag) type {
             return switch (tag) {
+                .alloc_inferred,
+                .alloc_inferred_mut,
                 .breakpoint,
                 .dbg_stmt,
                 .returnvoid,
-                .alloc_inferred,
                 .ret_ptr,
                 .ret_type,
                 .unreach_nocheck,
                 .@"unreachable",
                 => NoOp,
 
+                .alloc,
+                .alloc_mut,
                 .boolnot,
+                .compileerror,
                 .deref,
                 .@"return",
                 .isnull,
                 .isnonnull,
                 .iserr,
                 .ptrtoint,
-                .alloc,
                 .ensure_result_used,
                 .ensure_result_non_error,
                 .ensure_indexable,
@@ -310,6 +327,7 @@ pub const Inst = struct {
                 .ref,
                 .bitcast_ref,
                 .typeof,
+                .resolve_inferred_alloc,
                 .single_const_ptr_type,
                 .single_mut_ptr_type,
                 .many_const_ptr_type,
@@ -346,6 +364,7 @@ pub const Inst = struct {
                 .shl,
                 .shr,
                 .store,
+                .store_to_inferred_ptr,
                 .sub,
                 .subwrap,
                 .cmp_lt,
@@ -383,7 +402,6 @@ pub const Inst = struct {
                 .declval => DeclVal,
                 .declval_in_module => DeclValInModule,
                 .coerce_result_block_ptr => CoerceResultBlockPtr,
-                .compileerror => CompileError,
                 .loop => Loop,
                 .@"const" => Const,
                 .str => Str,
@@ -403,6 +421,7 @@ pub const Inst = struct {
                 .error_set => ErrorSet,
                 .slice => Slice,
                 .switchbr => SwitchBr,
+                .typeof_peer => TypeOfPeer,
             };
         }
 
@@ -413,7 +432,9 @@ pub const Inst = struct {
                 .add,
                 .addwrap,
                 .alloc,
+                .alloc_mut,
                 .alloc_inferred,
+                .alloc_inferred_mut,
                 .array_cat,
                 .array_mul,
                 .array_type,
@@ -487,6 +508,7 @@ pub const Inst = struct {
                 .mut_slice_type,
                 .const_slice_type,
                 .store,
+                .store_to_inferred_ptr,
                 .str,
                 .sub,
                 .subwrap,
@@ -510,6 +532,8 @@ pub const Inst = struct {
                 .slice_start,
                 .import,
                 .switch_range,
+                .typeof_peer,
+                .resolve_inferred_alloc,
                 => false,
 
                 .@"break",
@@ -689,16 +713,6 @@ pub const Inst = struct {
         positionals: struct {
             dest_type: *Inst,
             block: *Block,
-        },
-        kw_args: struct {},
-    };
-
-    pub const CompileError = struct {
-        pub const base_tag = Tag.compileerror;
-        base: Inst,
-
-        positionals: struct {
-            msg: []const u8,
         },
         kw_args: struct {},
     };
@@ -1031,6 +1045,14 @@ pub const Inst = struct {
             item: *Inst,
             body: Module.Body,
         };
+    };
+    pub const TypeOfPeer = struct {
+        pub const base_tag = .typeof_peer;
+        base: Inst,
+        positionals: struct {
+            items: []*Inst,
+        },
+        kw_args: struct {},
     };
 };
 
@@ -1914,14 +1936,29 @@ const EmitZIR = struct {
                 .sema_failure_retryable,
                 .dependency_failure,
                 => if (self.old_module.failed_decls.get(ir_decl)) |err_msg| {
-                    const fail_inst = try self.arena.allocator.create(Inst.CompileError);
+                    const fail_inst = try self.arena.allocator.create(Inst.UnOp);
                     fail_inst.* = .{
                         .base = .{
                             .src = ir_decl.src(),
-                            .tag = Inst.CompileError.base_tag,
+                            .tag = .compileerror,
                         },
                         .positionals = .{
-                            .msg = try self.arena.allocator.dupe(u8, err_msg.msg),
+                            .operand = blk: {
+                                const msg_str = try self.arena.allocator.dupe(u8, err_msg.msg);
+
+                                const str_inst = try self.arena.allocator.create(Inst.Str);
+                                str_inst.* = .{
+                                    .base = .{
+                                        .src = ir_decl.src(),
+                                        .tag = Inst.Str.base_tag,
+                                    },
+                                    .positionals = .{
+                                        .bytes = err_msg.msg,
+                                    },
+                                    .kw_args = .{},
+                                };
+                                break :blk &str_inst.base;
+                            },
                         },
                         .kw_args = .{},
                     };
@@ -1965,15 +2002,15 @@ const EmitZIR = struct {
 
     fn resolveInst(self: *EmitZIR, new_body: ZirBody, inst: *ir.Inst) !*Inst {
         if (inst.cast(ir.Inst.Constant)) |const_inst| {
-            const new_inst = if (const_inst.val.cast(Value.Payload.Function)) |func_pl| blk: {
-                const owner_decl = func_pl.func.owner_decl;
+            const new_inst = if (const_inst.val.castTag(.function)) |func_pl| blk: {
+                const owner_decl = func_pl.data.owner_decl;
                 break :blk try self.emitDeclVal(inst.src, mem.spanZ(owner_decl.name));
-            } else if (const_inst.val.cast(Value.Payload.DeclRef)) |declref| blk: {
-                const decl_ref = try self.emitDeclRef(inst.src, declref.decl);
+            } else if (const_inst.val.castTag(.decl_ref)) |declref| blk: {
+                const decl_ref = try self.emitDeclRef(inst.src, declref.data);
                 try new_body.instructions.append(decl_ref);
                 break :blk decl_ref;
-            } else if (const_inst.val.cast(Value.Payload.Variable)) |var_pl| blk: {
-                const owner_decl = var_pl.variable.owner_decl;
+            } else if (const_inst.val.castTag(.variable)) |var_pl| blk: {
+                const owner_decl = var_pl.data.owner_decl;
                 break :blk try self.emitDeclVal(inst.src, mem.spanZ(owner_decl.name));
             } else blk: {
                 break :blk (try self.emitTypedValue(inst.src, .{ .ty = inst.ty, .val = const_inst.val })).inst;
@@ -2044,28 +2081,58 @@ const EmitZIR = struct {
             },
             .sema_failure => {
                 const err_msg = self.old_module.failed_decls.get(module_fn.owner_decl).?;
-                const fail_inst = try self.arena.allocator.create(Inst.CompileError);
+                const fail_inst = try self.arena.allocator.create(Inst.UnOp);
                 fail_inst.* = .{
                     .base = .{
                         .src = src,
-                        .tag = Inst.CompileError.base_tag,
+                        .tag = .compileerror,
                     },
                     .positionals = .{
-                        .msg = try self.arena.allocator.dupe(u8, err_msg.msg),
+                        .operand = blk: {
+                            const msg_str = try self.arena.allocator.dupe(u8, err_msg.msg);
+
+                            const str_inst = try self.arena.allocator.create(Inst.Str);
+                            str_inst.* = .{
+                                .base = .{
+                                    .src = src,
+                                    .tag = Inst.Str.base_tag,
+                                },
+                                .positionals = .{
+                                    .bytes = msg_str,
+                                },
+                                .kw_args = .{},
+                            };
+                            break :blk &str_inst.base;
+                        },
                     },
                     .kw_args = .{},
                 };
                 try instructions.append(&fail_inst.base);
             },
             .dependency_failure => {
-                const fail_inst = try self.arena.allocator.create(Inst.CompileError);
+                const fail_inst = try self.arena.allocator.create(Inst.UnOp);
                 fail_inst.* = .{
                     .base = .{
                         .src = src,
-                        .tag = Inst.CompileError.base_tag,
+                        .tag = .compileerror,
                     },
                     .positionals = .{
-                        .msg = try self.arena.allocator.dupe(u8, "depends on another failed Decl"),
+                        .operand = blk: {
+                            const msg_str = try self.arena.allocator.dupe(u8, "depends on another failed Decl");
+
+                            const str_inst = try self.arena.allocator.create(Inst.Str);
+                            str_inst.* = .{
+                                .base = .{
+                                    .src = src,
+                                    .tag = Inst.Str.base_tag,
+                                },
+                                .positionals = .{
+                                    .bytes = msg_str,
+                                },
+                                .kw_args = .{},
+                            };
+                            break :blk &str_inst.base;
+                        },
                     },
                     .kw_args = .{},
                 };
@@ -2095,13 +2162,13 @@ const EmitZIR = struct {
 
     fn emitTypedValue(self: *EmitZIR, src: usize, typed_value: TypedValue) Allocator.Error!*Decl {
         const allocator = &self.arena.allocator;
-        if (typed_value.val.cast(Value.Payload.DeclRef)) |decl_ref| {
-            const decl = decl_ref.decl;
+        if (typed_value.val.castTag(.decl_ref)) |decl_ref| {
+            const decl = decl_ref.data;
             return try self.emitUnnamedDecl(try self.emitDeclRef(src, decl));
-        } else if (typed_value.val.cast(Value.Payload.Variable)) |variable| {
+        } else if (typed_value.val.castTag(.variable)) |variable| {
             return self.emitTypedValue(src, .{
                 .ty = typed_value.ty,
-                .val = variable.variable.init,
+                .val = variable.data.init,
             });
         }
         if (typed_value.val.isUndef()) {
@@ -2160,7 +2227,7 @@ const EmitZIR = struct {
                 return self.emitType(src, ty);
             },
             .Fn => {
-                const module_fn = typed_value.val.cast(Value.Payload.Function).?.func;
+                const module_fn = typed_value.val.castTag(.function).?.data;
                 return self.emitFn(module_fn, src, typed_value.ty);
             },
             .Array => {
@@ -2193,7 +2260,7 @@ const EmitZIR = struct {
             else
                 return self.emitPrimitive(src, .@"false"),
             .EnumLiteral => {
-                const enum_literal = @fieldParentPtr(Value.Payload.Bytes, "base", typed_value.val.ptr_otherwise);
+                const enum_literal = typed_value.val.castTag(.enum_literal).?;
                 const inst = try self.arena.allocator.create(Inst.Str);
                 inst.* = .{
                     .base = .{
@@ -2330,6 +2397,9 @@ const EmitZIR = struct {
                 .cmp_neq => try self.emitBinOp(inst.src, new_body, inst.castTag(.cmp_neq).?, .cmp_neq),
                 .booland => try self.emitBinOp(inst.src, new_body, inst.castTag(.booland).?, .booland),
                 .boolor => try self.emitBinOp(inst.src, new_body, inst.castTag(.boolor).?, .boolor),
+                .bitand => try self.emitBinOp(inst.src, new_body, inst.castTag(.bitand).?, .bitand),
+                .bitor => try self.emitBinOp(inst.src, new_body, inst.castTag(.bitor).?, .bitor),
+                .xor => try self.emitBinOp(inst.src, new_body, inst.castTag(.xor).?, .xor),
 
                 .bitcast => try self.emitCast(inst.src, new_body, inst.castTag(.bitcast).?, .bitcast),
                 .intcast => try self.emitCast(inst.src, new_body, inst.castTag(.intcast).?, .intcast),
@@ -2690,9 +2760,8 @@ const EmitZIR = struct {
                         .signed => .@"true",
                         .unsigned => .@"false",
                     });
-                    const bits_payload = try self.arena.allocator.create(Value.Payload.Int_u64);
-                    bits_payload.* = .{ .int = info.bits };
-                    const bits = try self.emitComptimeIntVal(src, Value.initPayload(&bits_payload.base));
+                    const bits_val = try Value.Tag.int_u64.create(&self.arena.allocator, info.bits);
+                    const bits = try self.emitComptimeIntVal(src, bits_val);
                     const inttype_inst = try self.arena.allocator.create(Inst.IntType);
                     inttype_inst.* = .{
                         .base = .{
@@ -2727,7 +2796,7 @@ const EmitZIR = struct {
                     }
                 },
                 .Optional => {
-                    var buf: Type.Payload.PointerSimple = undefined;
+                    var buf: Type.Payload.ElemType = undefined;
                     const inst = try self.arena.allocator.create(Inst.UnOp);
                     inst.* = .{
                         .base = .{
@@ -2742,7 +2811,10 @@ const EmitZIR = struct {
                     return self.emitUnnamedDecl(&inst.base);
                 },
                 .Array => {
-                    var len_pl = Value.Payload.Int_u64{ .int = ty.arrayLen() };
+                    var len_pl = Value.Payload.U64{
+                        .base = .{ .tag = .int_u64 },
+                        .data = ty.arrayLen(),
+                    };
                     const len = Value.initPayload(&len_pl.base);
 
                     const inst = if (ty.sentinel()) |sentinel| blk: {

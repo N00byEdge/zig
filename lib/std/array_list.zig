@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -89,6 +89,13 @@ pub fn ArrayListAligned(comptime T: type, comptime alignment: ?u29) type {
             const result = allocator.shrink(self.allocatedSlice(), self.items.len);
             self.* = init(allocator);
             return result;
+        }
+
+        /// The caller owns the returned memory. ArrayList becomes empty.
+        pub fn toOwnedSliceSentinel(self: *Self, comptime sentinel: T) ![:sentinel]T {
+            try self.append(sentinel);
+            const result = self.toOwnedSlice();
+            return result[0 .. result.len - 1 :sentinel];
         }
 
         /// Insert `item` at index `n` by moving `list[n .. list.len]` to make room.
@@ -330,10 +337,20 @@ pub fn ArrayListAligned(comptime T: type, comptime alignment: ?u29) type {
             return self.pop();
         }
 
-        // For a nicer API, `items.len` is the length, not the capacity.
-        // This requires "unsafe" slicing.
-        fn allocatedSlice(self: Self) Slice {
+        /// Returns a slice of all the items plus the extra capacity, whose memory
+        /// contents are undefined.
+        pub fn allocatedSlice(self: Self) Slice {
+            // For a nicer API, `items.len` is the length, not the capacity.
+            // This requires "unsafe" slicing.
             return self.items.ptr[0..self.capacity];
+        }
+
+        /// Returns a slice of only the extra capacity after items.
+        /// This can be useful for writing directly into an `ArrayList`.
+        /// Note that such an operation must be followed up with a direct
+        /// modification of `self.items.len`.
+        pub fn unusedCapacitySlice(self: Self) Slice {
+            return self.allocatedSlice()[self.items.len..];
         }
     };
 }
@@ -387,6 +404,13 @@ pub fn ArrayListAlignedUnmanaged(comptime T: type, comptime alignment: ?u29) typ
             const result = allocator.shrink(self.allocatedSlice(), self.items.len);
             self.* = Self{};
             return result;
+        }
+
+        /// The caller owns the returned memory. ArrayList becomes empty.
+        pub fn toOwnedSliceSentinel(self: *Self, allocator: *Allocator, comptime sentinel: T) ![:sentinel]T {
+            try self.append(allocator, sentinel);
+            const result = self.toOwnedSlice(allocator);
+            return result[0 .. result.len - 1 :sentinel];
         }
 
         /// Insert `item` at index `n`. Moves `list[n .. list.len]`
@@ -1119,5 +1143,29 @@ test "std.ArrayList/ArrayListUnmanaged.addManyAsArray" {
         list.addManyAsArrayAssumeCapacity(4).* = "asdf".*;
 
         testing.expectEqualSlices(u8, list.items, "aoeuasdf");
+    }
+}
+
+test "std.ArrayList/ArrayListUnmanaged.toOwnedSliceSentinel" {
+    const a = testing.allocator;
+    {
+        var list = ArrayList(u8).init(a);
+        defer list.deinit();
+
+        try list.appendSlice("foobar");
+
+        const result = try list.toOwnedSliceSentinel(0);
+        defer a.free(result);
+        testing.expectEqualStrings(result, mem.spanZ(result.ptr));
+    }
+    {
+        var list = ArrayListUnmanaged(u8){};
+        defer list.deinit(a);
+
+        try list.appendSlice(a, "foobar");
+
+        const result = try list.toOwnedSliceSentinel(a, 0);
+        defer a.free(result);
+        testing.expectEqualStrings(result, mem.spanZ(result.ptr));
     }
 }

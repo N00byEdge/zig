@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -20,6 +20,10 @@ pub var base_allocator_instance = std.heap.FixedBufferAllocator.init("");
 
 /// TODO https://github.com/ziglang/zig/issues/5738
 pub var log_level = std.log.Level.warn;
+
+/// This is available to any test that wants to execute Zig in a child process.
+/// It will be the same executable that is running `zig test`.
+pub var zig_exe_path: []const u8 = undefined;
 
 /// This function is intended to be used only in tests. It prints diagnostics to stderr
 /// and then aborts when actual_error_union is not expected_error.
@@ -303,10 +307,9 @@ fn getCwdOrWasiPreopen() std.fs.Dir {
 
 pub fn tmpDir(opts: std.fs.Dir.OpenDirOptions) TmpDir {
     var random_bytes: [TmpDir.random_bytes_count]u8 = undefined;
-    std.crypto.randomBytes(&random_bytes) catch
-        @panic("unable to make tmp dir for testing: unable to get random bytes");
+    std.crypto.random.bytes(&random_bytes);
     var sub_path: [TmpDir.sub_path_len]u8 = undefined;
-    std.fs.base64_encoder.encode(&sub_path, &random_bytes);
+    _ = std.fs.base64_encoder.encode(&sub_path, &random_bytes);
 
     var cwd = getCwdOrWasiPreopen();
     var cache_dir = cwd.makeOpenPath("zig-cache", .{}) catch

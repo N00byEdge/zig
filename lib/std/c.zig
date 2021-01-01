@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -12,6 +12,7 @@ pub const Token = tokenizer.Token;
 pub const Tokenizer = tokenizer.Tokenizer;
 pub const parse = @import("c/parse.zig").parse;
 pub const ast = @import("c/ast.zig");
+pub const builtins = @import("c/builtins.zig");
 
 test "" {
     _ = tokenizer;
@@ -80,6 +81,7 @@ pub extern "c" fn fread(ptr: [*]u8, size_of_type: usize, item_count: usize, stre
 pub extern "c" fn printf(format: [*:0]const u8, ...) c_int;
 pub extern "c" fn abort() noreturn;
 pub extern "c" fn exit(code: c_int) noreturn;
+pub extern "c" fn _exit(code: c_int) noreturn;
 pub extern "c" fn isatty(fd: fd_t) c_int;
 pub extern "c" fn close(fd: fd_t) c_int;
 pub extern "c" fn lseek(fd: fd_t, offset: off_t, whence: c_int) off_t;
@@ -264,6 +266,18 @@ pub extern "c" fn pthread_attr_setguardsize(attr: *pthread_attr_t, guardsize: us
 pub extern "c" fn pthread_attr_destroy(attr: *pthread_attr_t) c_int;
 pub extern "c" fn pthread_self() pthread_t;
 pub extern "c" fn pthread_join(thread: pthread_t, arg_return: ?*?*c_void) c_int;
+pub extern "c" fn pthread_atfork(
+    prepare: ?fn () callconv(.C) void,
+    parent: ?fn () callconv(.C) void,
+    child: ?fn () callconv(.C) void,
+) c_int;
+pub extern "c" fn sem_init(sem: *sem_t, pshared: c_int, value: c_uint) c_int;
+pub extern "c" fn sem_destroy(sem: *sem_t) c_int;
+pub extern "c" fn sem_post(sem: *sem_t) c_int;
+pub extern "c" fn sem_wait(sem: *sem_t) c_int;
+pub extern "c" fn sem_trywait(sem: *sem_t) c_int;
+pub extern "c" fn sem_timedwait(sem: *sem_t, abs_timeout: *const timespec) c_int;
+pub extern "c" fn sem_getvalue(sem: *sem_t, sval: *c_int) c_int;
 
 pub extern "c" fn kqueue() c_int;
 pub extern "c" fn kevent(
@@ -310,6 +324,7 @@ pub extern "c" fn dn_expand(
 pub const PTHREAD_MUTEX_INITIALIZER = pthread_mutex_t{};
 pub extern "c" fn pthread_mutex_lock(mutex: *pthread_mutex_t) c_int;
 pub extern "c" fn pthread_mutex_unlock(mutex: *pthread_mutex_t) c_int;
+pub extern "c" fn pthread_mutex_trylock(mutex: *pthread_mutex_t) c_int;
 pub extern "c" fn pthread_mutex_destroy(mutex: *pthread_mutex_t) c_int;
 
 pub const PTHREAD_COND_INITIALIZER = pthread_cond_t{};
@@ -335,6 +350,8 @@ pub extern "c" fn prctl(option: c_int, ...) c_int;
 
 pub extern "c" fn getrlimit(resource: rlimit_resource, rlim: *rlimit) c_int;
 pub extern "c" fn setrlimit(resource: rlimit_resource, rlim: *const rlimit) c_int;
+
+pub extern "c" fn fmemopen(noalias buf: ?*c_void, size: usize, noalias mode: [*:0]const u8) ?*FILE;
 
 pub const max_align_t = if (std.Target.current.abi == .msvc)
     f64

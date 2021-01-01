@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2015-2020 Zig Contributors
+// Copyright (c) 2015-2021 Zig Contributors
 // This file is part of [zig](https://ziglang.org/), which is MIT licensed.
 // The MIT license requires this copyright notice to be included in all copies
 // and substantial portions of the software.
@@ -72,7 +72,7 @@ pub const WriteFileStep = struct {
         var digest: [48]u8 = undefined;
         hash.final(&digest);
         var hash_basename: [64]u8 = undefined;
-        fs.base64_encoder.encode(&hash_basename, &digest);
+        _ = fs.base64_encoder.encode(&hash_basename, &digest);
         self.output_dir = try fs.path.join(self.builder.allocator, &[_][]const u8{
             self.builder.cache_root,
             "o",

@@ -24,6 +24,7 @@ const build_options = @import("build_options");
 const target_util = @import("../target.zig");
 const glibc = @import("../glibc.zig");
 const Cache = @import("../Cache.zig");
+const llvm_backend = @import("../llvm_backend.zig");
 
 const default_entry_addr = 0x8000000;
 
@@ -32,6 +33,9 @@ pub const base_tag: File.Tag = .elf;
 base: File,
 
 ptr_width: PtrWidth,
+
+/// If this is not null, an object file is created by LLVM and linked with LLD afterwards.
+llvm_ir_module: ?*llvm_backend.LLVMIRModule = null,
 
 /// Stored in native-endian format, depending on target endianness needs to be bswapped on read/write.
 /// Same order as in the file.
@@ -224,7 +228,13 @@ pub const SrcFn = struct {
 pub fn openPath(allocator: *Allocator, sub_path: []const u8, options: link.Options) !*Elf {
     assert(options.object_format == .elf);
 
-    if (options.use_llvm) return error.LLVMBackendUnimplementedForELF; // TODO
+    if (build_options.have_llvm and options.use_llvm) {
+        const self = try createEmpty(allocator, options);
+        errdefer self.base.destroy();
+
+        self.llvm_ir_module = try llvm_backend.LLVMIRModule.create(allocator, sub_path, options);
+        return self;
+    }
 
     const file = try options.emit.?.directory.handle.createFile(sub_path, .{
         .truncate = false,
@@ -288,6 +298,10 @@ pub fn createEmpty(gpa: *Allocator, options: link.Options) !*Elf {
 }
 
 pub fn deinit(self: *Elf) void {
+    if (build_options.have_llvm)
+        if (self.llvm_ir_module) |ir_module|
+            ir_module.deinit(self.base.allocator);
+
     self.sections.deinit(self.base.allocator);
     self.program_headers.deinit(self.base.allocator);
     self.shstrtab.deinit(self.base.allocator);
@@ -304,6 +318,7 @@ pub fn deinit(self: *Elf) void {
 }
 
 pub fn getDeclVAddr(self: *Elf, decl: *const Module.Decl) u64 {
+    assert(self.llvm_ir_module == null);
     assert(decl.link.elf.local_sym_index != 0);
     return self.local_symbols.items[decl.link.elf.local_sym_index].st_value;
 }
@@ -423,6 +438,8 @@ fn updateString(self: *Elf, old_str_off: u32, new_name: []const u8) !u32 {
 }
 
 pub fn populateMissingMetadata(self: *Elf) !void {
+    assert(self.llvm_ir_module == null);
+
     const small_ptr = switch (self.ptr_width) {
         .p32 => true,
         .p64 => false,
@@ -726,6 +743,9 @@ pub fn flush(self: *Elf, comp: *Compilation) !void {
 pub fn flushModule(self: *Elf, comp: *Compilation) !void {
     const tracy = trace(@src());
     defer tracy.end();
+
+    if (build_options.have_llvm)
+        if (self.llvm_ir_module) |llvm_ir_module| return try llvm_ir_module.flushModule(comp);
 
     // TODO This linker code currently assumes there is only 1 compilation unit and it corresponds to the
     // Zig source code.
@@ -1261,6 +1281,9 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
     const stack_size = self.base.options.stack_size_override orelse 16777216;
     const allow_shlib_undefined = self.base.options.allow_shlib_undefined orelse !self.base.options.is_native_os;
     const compiler_rt_path: ?[]const u8 = if (self.base.options.include_compiler_rt) blk: {
+        // TODO: remove when stage2 can build compiler_rt.zig
+        if (!build_options.is_stage1) break :blk null;
+
         if (is_exe_or_dyn_lib) {
             break :blk comp.compiler_rt_static_lib.?.full_object_path;
         } else {
@@ -1310,7 +1333,7 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         man.hash.addListOfBytes(self.base.options.lib_dirs);
         man.hash.addListOfBytes(self.base.options.rpath_list);
         man.hash.add(self.base.options.each_lib_rpath);
-        man.hash.add(self.base.options.is_compiler_rt_or_libc);
+        man.hash.add(self.base.options.skip_linker_dependencies);
         man.hash.add(self.base.options.z_nodelete);
         man.hash.add(self.base.options.z_defs);
         if (self.base.options.link_libc) {
@@ -1327,6 +1350,7 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         man.hash.addStringSet(self.base.options.system_libs);
         man.hash.add(allow_shlib_undefined);
         man.hash.add(self.base.options.bind_global_refs_locally);
+        man.hash.add(self.base.options.tsan);
 
         // We don't actually care whether it's a cache hit or miss; we just need the digest and the lock.
         _ = try man.hit();
@@ -1441,8 +1465,14 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
 
     if (link_in_crt) {
         const crt1o: []const u8 = o: {
-            if (target.os.tag == .netbsd or target.os.tag == .openbsd) {
+            if (target.os.tag == .netbsd) {
                 break :o "crt0.o";
+            } else if (target.os.tag == .openbsd) {
+                if (self.base.options.link_mode == .Static) {
+                    break :o "rcrt0.o";
+                } else {
+                    break :o "crt0.o";
+                }
             } else if (target.isAndroid()) {
                 if (self.base.options.link_mode == .Dynamic) {
                     break :o "crtbegin_dynamic.o";
@@ -1539,8 +1569,18 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
         try argv.append(p);
     }
 
+    // TSAN
+    if (self.base.options.tsan) {
+        try argv.append(comp.tsan_static_lib.?.full_object_path);
+    }
+
     // libc
-    if (is_exe_or_dyn_lib and !self.base.options.is_compiler_rt_or_libc and !self.base.options.link_libc) {
+    // TODO: enable when stage2 can build c.zig
+    if (is_exe_or_dyn_lib and
+        !self.base.options.skip_linker_dependencies and
+        !self.base.options.link_libc and
+        build_options.is_stage1)
+    {
         try argv.append(comp.libc_static_lib.?.full_object_path);
     }
 
@@ -1562,9 +1602,7 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
             const arg = if (ext == .shared_library) link_lib else try std.fmt.allocPrint(arena, "-l{}", .{link_lib});
             argv.appendAssumeCapacity(arg);
         }
-    }
 
-    if (!is_obj) {
         // libc++ dep
         if (self.base.options.link_libcpp) {
             try argv.append(comp.libcxxabi_static_lib.?.full_object_path);
@@ -1584,7 +1622,7 @@ fn linkWithLLD(self: *Elf, comp: *Compilation) !void {
                     try argv.append("-lm");
                 }
 
-                if (target.os.tag == .freebsd or target.os.tag == .netbsd) {
+                if (target.os.tag == .freebsd or target.os.tag == .netbsd or target.os.tag == .openbsd) {
                     try argv.append("-lpthread");
                 }
             } else if (target.isGnuLibC()) {
@@ -2036,6 +2074,8 @@ fn allocateTextBlock(self: *Elf, text_block: *TextBlock, new_block_size: u64, al
 }
 
 pub fn allocateDeclIndexes(self: *Elf, decl: *Module.Decl) !void {
+    if (self.llvm_ir_module) |_| return;
+
     if (decl.link.elf.local_sym_index != 0) return;
 
     try self.local_symbols.ensureCapacity(self.base.allocator, self.local_symbols.items.len + 1);
@@ -2072,6 +2112,8 @@ pub fn allocateDeclIndexes(self: *Elf, decl: *Module.Decl) !void {
 }
 
 pub fn freeDecl(self: *Elf, decl: *Module.Decl) void {
+    if (self.llvm_ir_module) |_| return;
+
     // Appending to free lists is allowed to fail because the free lists are heuristics based anyway.
     self.freeTextBlock(&decl.link.elf);
     if (decl.link.elf.local_sym_index != 0) {
@@ -2109,6 +2151,9 @@ pub fn updateDecl(self: *Elf, module: *Module, decl: *Module.Decl) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
+    if (build_options.have_llvm)
+        if (self.llvm_ir_module) |llvm_ir_module| return try llvm_ir_module.updateDecl(module, decl);
+
     var code_buffer = std.ArrayList(u8).init(self.base.allocator);
     defer code_buffer.deinit();
 
@@ -2138,7 +2183,7 @@ pub fn updateDecl(self: *Elf, module: *Module, decl: *Module.Decl) !void {
             for (zir_dumps) |fn_name| {
                 if (mem.eql(u8, mem.spanZ(decl.name), fn_name)) {
                     std.debug.print("\n{}\n", .{decl.name});
-                    typed_value.val.cast(Value.Payload.Function).?.func.dump(module.*);
+                    typed_value.val.castTag(.function).?.data.dump(module.*);
                 }
             }
         }
@@ -2584,6 +2629,8 @@ pub fn updateDeclExports(
     decl: *const Module.Decl,
     exports: []const *Module.Export,
 ) !void {
+    if (self.llvm_ir_module) |_| return;
+
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -2657,6 +2704,8 @@ pub fn updateDeclLineNumber(self: *Elf, module: *Module, decl: *const Module.Dec
     const tracy = trace(@src());
     defer tracy.end();
 
+    if (self.llvm_ir_module) |_| return;
+
     const container_scope = decl.scope.cast(Module.Scope.Container).?;
     const tree = container_scope.file_scope.contents.tree;
     const file_ast_decls = tree.root_node.decls();
@@ -2675,6 +2724,8 @@ pub fn updateDeclLineNumber(self: *Elf, module: *Module, decl: *const Module.Dec
 }
 
 pub fn deleteExport(self: *Elf, exp: Export) void {
+    if (self.llvm_ir_module) |_| return;
+
     const sym_index = exp.sym_index orelse return;
     self.global_symbol_free_list.append(self.base.allocator, sym_index) catch {};
     self.global_symbols.items[sym_index].st_info = 0;

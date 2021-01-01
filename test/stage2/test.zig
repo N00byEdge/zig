@@ -370,6 +370,64 @@ pub fn addCases(ctx: *TestContext) !void {
             "",
         );
     }
+    {
+        var case = ctx.exe("@TypeOf", linux_x64);
+        case.addCompareOutput(
+            \\export fn _start() noreturn {
+            \\    var x: usize = 0;
+            \\    const z = @TypeOf(x, @as(u128, 5));
+            \\    assert(z == u128);
+            \\
+            \\    exit();
+            \\}
+            \\
+            \\pub fn assert(ok: bool) void {
+            \\    if (!ok) unreachable; // assertion failure
+            \\}
+            \\
+            \\fn exit() noreturn {
+            \\    asm volatile ("syscall"
+            \\        :
+            \\        : [number] "{rax}" (231),
+            \\          [arg1] "{rdi}" (0)
+            \\        : "rcx", "r11", "memory"
+            \\    );
+            \\    unreachable;
+            \\}
+        ,
+            "",
+        );
+        case.addCompareOutput(
+            \\export fn _start() noreturn {
+            \\    const z = @TypeOf(true);
+            \\    assert(z == bool);
+            \\
+            \\    exit();
+            \\}
+            \\
+            \\pub fn assert(ok: bool) void {
+            \\    if (!ok) unreachable; // assertion failure
+            \\}
+            \\
+            \\fn exit() noreturn {
+            \\    asm volatile ("syscall"
+            \\        :
+            \\        : [number] "{rax}" (231),
+            \\          [arg1] "{rdi}" (0)
+            \\        : "rcx", "r11", "memory"
+            \\    );
+            \\    unreachable;
+            \\}
+        ,
+            "",
+        );
+        case.addError(
+            \\export fn _start() noreturn {
+            \\    const z = @TypeOf(true, 1);
+            \\    unreachable;
+            \\}
+        , &[_][]const u8{":2:29: error: incompatible types: 'bool' and 'comptime_int'"});
+    }
 
     {
         var case = ctx.exe("assert function", linux_x64);
@@ -1113,6 +1171,13 @@ pub fn addCases(ctx: *TestContext) !void {
         \\fn entry() void {}
     , &[_][]const u8{":2:4: error: redefinition of 'entry'"});
 
+    ctx.compileError("compileError", linux_x64,
+        \\export fn _start() noreturn {
+        \\  @compileError("this is an error");
+        \\  unreachable;
+        \\}
+    , &[_][]const u8{":2:3: error: this is an error"});
+
     {
         var case = ctx.obj("variable shadowing", linux_x64);
         case.addError(
@@ -1145,5 +1210,125 @@ pub fn addCases(ctx: *TestContext) !void {
             \\}
             \\extern var foo;
         , &[_][]const u8{":4:1: error: unable to infer variable type"});
+    }
+
+    {
+        var case = ctx.exe("break/continue", linux_x64);
+
+        // Break out of loop
+        case.addCompareOutput(
+            \\export fn _start() noreturn {
+            \\    while (true) {
+            \\        break;
+            \\    }
+            \\
+            \\    exit();
+            \\}
+            \\
+            \\fn exit() noreturn {
+            \\    asm volatile ("syscall"
+            \\        :
+            \\        : [number] "{rax}" (231),
+            \\          [arg1] "{rdi}" (0)
+            \\        : "rcx", "r11", "memory"
+            \\    );
+            \\    unreachable;
+            \\}
+        ,
+            "",
+        );
+        case.addCompareOutput(
+            \\export fn _start() noreturn {
+            \\    foo: while (true) {
+            \\        break :foo;
+            \\    }
+            \\
+            \\    exit();
+            \\}
+            \\
+            \\fn exit() noreturn {
+            \\    asm volatile ("syscall"
+            \\        :
+            \\        : [number] "{rax}" (231),
+            \\          [arg1] "{rdi}" (0)
+            \\        : "rcx", "r11", "memory"
+            \\    );
+            \\    unreachable;
+            \\}
+        ,
+            "",
+        );
+
+        // Continue in loop
+        case.addCompareOutput(
+            \\export fn _start() noreturn {
+            \\    var i: u64 = 0;
+            \\    while (true) : (i+=1) {
+            \\        if (i == 4) exit();
+            \\        continue;
+            \\    }
+            \\}
+            \\
+            \\fn exit() noreturn {
+            \\    asm volatile ("syscall"
+            \\        :
+            \\        : [number] "{rax}" (231),
+            \\          [arg1] "{rdi}" (0)
+            \\        : "rcx", "r11", "memory"
+            \\    );
+            \\    unreachable;
+            \\}
+        ,
+            "",
+        );
+        case.addCompareOutput(
+            \\export fn _start() noreturn {
+            \\    var i: u64 = 0;
+            \\    foo: while (true) : (i+=1) {
+            \\        if (i == 4) exit();
+            \\        continue :foo;
+            \\    }
+            \\}
+            \\
+            \\fn exit() noreturn {
+            \\    asm volatile ("syscall"
+            \\        :
+            \\        : [number] "{rax}" (231),
+            \\          [arg1] "{rdi}" (0)
+            \\        : "rcx", "r11", "memory"
+            \\    );
+            \\    unreachable;
+            \\}
+        ,
+            "",
+        );
+    }
+
+    {
+        var case = ctx.exe("unused labels", linux_x64);
+        case.addError(
+            \\comptime {
+            \\    foo: {}
+            \\}
+        , &[_][]const u8{":2:5: error: unused block label"});
+        case.addError(
+            \\comptime {
+            \\    foo: while (true) {}
+            \\}
+        , &[_][]const u8{":2:5: error: unused while label"});
+        case.addError(
+            \\comptime {
+            \\    foo: for ("foo") |_| {}
+            \\}
+        , &[_][]const u8{":2:5: error: unused for label"});
+    }
+
+    {
+        var case = ctx.exe("bad inferred variable type", linux_x64);
+        case.addError(
+            \\export fn foo() void {
+            \\    var x = null;
+            \\}
+        , &[_][]const u8{":2:9: error: variable of type '@Type(.Null)' must be const or comptime"});
     }
 }
