@@ -149,13 +149,13 @@ pub const Config = struct {
     thread_safe: bool = !std.builtin.single_threaded,
 
     /// What type of mutex you'd like to use, for thread safety.
-    /// when specfied, the mutex type must have the same shape as `std.Mutex` and
-    /// `std.mutex.Dummy`, and have no required fields. Specifying this field causes
+    /// when specfied, the mutex type must have the same shape as `std.Thread.Mutex` and
+    /// `std.Thread.Mutex.Dummy`, and have no required fields. Specifying this field causes
     /// the `thread_safe` field to be ignored.
     ///
     /// when null (default):
-    /// * the mutex type defaults to `std.Mutex` when thread_safe is enabled.
-    /// * the mutex type defaults to `std.mutex.Dummy` otherwise.
+    /// * the mutex type defaults to `std.Thread.Mutex` when thread_safe is enabled.
+    /// * the mutex type defaults to `std.Thread.Mutex.Dummy` otherwise.
     MutexType: ?type = null,
 
     /// This is a temporary debugging trick you can use to turn segfaults into more helpful
@@ -187,9 +187,9 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
         const mutex_init = if (config.MutexType) |T|
             T{}
         else if (config.thread_safe)
-            std.Mutex{}
+            std.Thread.Mutex{}
         else
-            std.mutex.Dummy{};
+            std.Thread.Mutex.Dummy{};
 
         const stack_n = config.stack_trace_frames;
         const one_trace_size = @sizeOf(usize) * stack_n;
@@ -314,7 +314,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
                         if (is_used) {
                             const slot_index = @intCast(SlotIndex, used_bits_byte * 8 + bit_index);
                             const stack_trace = bucketStackTrace(bucket, size_class, slot_index, .alloc);
-                            log.err("Memory leak detected: {}", .{stack_trace});
+                            log.err("Memory leak detected: {s}", .{stack_trace});
                             leaks = true;
                         }
                         if (bit_index == math.maxInt(u3))
@@ -342,7 +342,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
             }
             var it = self.large_allocations.iterator();
             while (it.next()) |large_alloc| {
-                log.err("Memory leak detected: {}", .{large_alloc.value.getStackTrace()});
+                log.err("Memory leak detected: {s}", .{large_alloc.value.getStackTrace()});
                 leaks = true;
             }
             return leaks;
@@ -443,7 +443,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
                     .index = 0,
                 };
                 std.debug.captureStackTrace(ret_addr, &free_stack_trace);
-                log.err("Allocation size {} bytes does not match free size {}. Allocation: {} Free: {}", .{
+                log.err("Allocation size {d} bytes does not match free size {d}. Allocation: {s} Free: {s}", .{
                     entry.value.bytes.len,
                     old_mem.len,
                     entry.value.getStackTrace(),
@@ -526,7 +526,7 @@ pub fn GeneralPurposeAllocator(comptime config: Config) type {
                         .index = 0,
                     };
                     std.debug.captureStackTrace(ret_addr, &second_free_stack_trace);
-                    log.err("Double free detected. Allocation: {} First free: {} Second free: {}", .{
+                    log.err("Double free detected. Allocation: {s} First free: {s} Second free: {s}", .{
                         alloc_stack_trace,
                         free_stack_trace,
                         second_free_stack_trace,
@@ -869,9 +869,9 @@ test "realloc large object to small object" {
 }
 
 test "overrideable mutexes" {
-    var gpa = GeneralPurposeAllocator(.{ .MutexType = std.Mutex }){
+    var gpa = GeneralPurposeAllocator(.{ .MutexType = std.Thread.Mutex }){
         .backing_allocator = std.testing.allocator,
-        .mutex = std.Mutex{},
+        .mutex = std.Thread.Mutex{},
     };
     defer std.testing.expect(!gpa.deinit());
     const allocator = &gpa.allocator;

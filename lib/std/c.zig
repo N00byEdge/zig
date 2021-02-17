@@ -14,7 +14,7 @@ pub const parse = @import("c/parse.zig").parse;
 pub const ast = @import("c/ast.zig");
 pub const builtins = @import("c/builtins.zig");
 
-test "" {
+test {
     _ = tokenizer;
 }
 
@@ -73,10 +73,10 @@ pub fn versionCheck(glibc_version: builtin.Version) type {
 
 pub extern "c" var environ: [*:null]?[*:0]u8;
 
-pub extern "c" fn fopen(filename: [*:0]const u8, modes: [*:0]const u8) ?*FILE;
+pub extern "c" fn fopen(noalias filename: [*:0]const u8, noalias modes: [*:0]const u8) ?*FILE;
 pub extern "c" fn fclose(stream: *FILE) c_int;
-pub extern "c" fn fwrite(ptr: [*]const u8, size_of_type: usize, item_count: usize, stream: *FILE) usize;
-pub extern "c" fn fread(ptr: [*]u8, size_of_type: usize, item_count: usize, stream: *FILE) usize;
+pub extern "c" fn fwrite(noalias ptr: [*]const u8, size_of_type: usize, item_count: usize, noalias stream: *FILE) usize;
+pub extern "c" fn fread(noalias ptr: [*]u8, size_of_type: usize, item_count: usize, noalias stream: *FILE) usize;
 
 pub extern "c" fn printf(format: [*:0]const u8, ...) c_int;
 pub extern "c" fn abort() noreturn;
@@ -108,7 +108,6 @@ pub extern "c" fn fork() c_int;
 pub extern "c" fn access(path: [*:0]const u8, mode: c_uint) c_int;
 pub extern "c" fn faccessat(dirfd: fd_t, path: [*:0]const u8, mode: c_uint, flags: c_uint) c_int;
 pub extern "c" fn pipe(fds: *[2]fd_t) c_int;
-pub extern "c" fn pipe2(fds: *[2]fd_t, flags: u32) c_int;
 pub extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 pub extern "c" fn mkdirat(dirfd: fd_t, path: [*:0]const u8, mode: u32) c_int;
 pub extern "c" fn symlink(existing: [*:0]const u8, new: [*:0]const u8) c_int;
@@ -153,9 +152,9 @@ pub extern "c" fn socketpair(domain: c_uint, sock_type: c_uint, protocol: c_uint
 pub extern "c" fn listen(sockfd: fd_t, backlog: c_uint) c_int;
 pub extern "c" fn getsockname(sockfd: fd_t, noalias addr: *sockaddr, noalias addrlen: *socklen_t) c_int;
 pub extern "c" fn connect(sockfd: fd_t, sock_addr: *const sockaddr, addrlen: socklen_t) c_int;
-pub extern "c" fn accept(sockfd: fd_t, addr: ?*sockaddr, addrlen: ?*socklen_t) c_int;
-pub extern "c" fn accept4(sockfd: fd_t, addr: ?*sockaddr, addrlen: ?*socklen_t, flags: c_uint) c_int;
-pub extern "c" fn getsockopt(sockfd: fd_t, level: u32, optname: u32, optval: ?*c_void, optlen: *socklen_t) c_int;
+pub extern "c" fn accept(sockfd: fd_t, noalias addr: ?*sockaddr, noalias addrlen: ?*socklen_t) c_int;
+pub extern "c" fn accept4(sockfd: fd_t, noalias addr: ?*sockaddr, noalias addrlen: ?*socklen_t, flags: c_uint) c_int;
+pub extern "c" fn getsockopt(sockfd: fd_t, level: u32, optname: u32, noalias optval: ?*c_void, noalias optlen: *socklen_t) c_int;
 pub extern "c" fn setsockopt(sockfd: fd_t, level: u32, optname: u32, optval: ?*const c_void, optlen: socklen_t) c_int;
 pub extern "c" fn send(sockfd: fd_t, buf: *const c_void, len: usize, flags: u32) isize;
 pub extern "c" fn sendto(
@@ -271,6 +270,10 @@ pub extern "c" fn pthread_atfork(
     parent: ?fn () callconv(.C) void,
     child: ?fn () callconv(.C) void,
 ) c_int;
+pub extern "c" fn pthread_key_create(key: *pthread_key_t, destructor: ?fn (value: *c_void) callconv(.C) void) c_int;
+pub extern "c" fn pthread_key_delete(key: pthread_key_t) c_int;
+pub extern "c" fn pthread_getspecific(key: pthread_key_t) ?*c_void;
+pub extern "c" fn pthread_setspecific(key: pthread_key_t, value: ?*c_void) c_int;
 pub extern "c" fn sem_init(sem: *sem_t, pshared: c_int, value: c_uint) c_int;
 pub extern "c" fn sem_destroy(sem: *sem_t) c_int;
 pub extern "c" fn sem_post(sem: *sem_t) c_int;
@@ -334,6 +337,13 @@ pub extern "c" fn pthread_cond_signal(cond: *pthread_cond_t) c_int;
 pub extern "c" fn pthread_cond_broadcast(cond: *pthread_cond_t) c_int;
 pub extern "c" fn pthread_cond_destroy(cond: *pthread_cond_t) c_int;
 
+pub extern "c" fn pthread_rwlock_destroy(rwl: *pthread_rwlock_t) callconv(.C) c_int;
+pub extern "c" fn pthread_rwlock_rdlock(rwl: *pthread_rwlock_t) callconv(.C) c_int;
+pub extern "c" fn pthread_rwlock_wrlock(rwl: *pthread_rwlock_t) callconv(.C) c_int;
+pub extern "c" fn pthread_rwlock_tryrdlock(rwl: *pthread_rwlock_t) callconv(.C) c_int;
+pub extern "c" fn pthread_rwlock_trywrlock(rwl: *pthread_rwlock_t) callconv(.C) c_int;
+pub extern "c" fn pthread_rwlock_unlock(rwl: *pthread_rwlock_t) callconv(.C) c_int;
+
 pub const pthread_t = *opaque {};
 pub const FILE = opaque {};
 
@@ -352,6 +362,11 @@ pub extern "c" fn getrlimit(resource: rlimit_resource, rlim: *rlimit) c_int;
 pub extern "c" fn setrlimit(resource: rlimit_resource, rlim: *const rlimit) c_int;
 
 pub extern "c" fn fmemopen(noalias buf: ?*c_void, size: usize, noalias mode: [*:0]const u8) ?*FILE;
+
+pub extern "c" fn syslog(priority: c_int, message: [*:0]const u8, ...) void;
+pub extern "c" fn openlog(ident: [*:0]const u8, logopt: c_int, facility: c_int) void;
+pub extern "c" fn closelog() void;
+pub extern "c" fn setlogmask(maskpri: c_int) c_int;
 
 pub const max_align_t = if (std.Target.current.abi == .msvc)
     f64

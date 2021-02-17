@@ -76,12 +76,12 @@ pub fn Reader(
                 start_index += bytes_read;
 
                 if (start_index - original_len > max_append_size) {
-                    array_list.shrink(original_len + max_append_size);
+                    array_list.shrinkAndFree(original_len + max_append_size);
                     return error.StreamTooLong;
                 }
 
                 if (bytes_read != dest_slice.len) {
-                    array_list.shrink(start_index);
+                    array_list.shrinkAndFree(start_index);
                     return;
                 }
 
@@ -111,7 +111,7 @@ pub fn Reader(
             delimiter: u8,
             max_size: usize,
         ) !void {
-            array_list.shrink(0);
+            array_list.shrinkAndFree(0);
             while (true) {
                 var byte: u8 = try self.readByte();
 
@@ -271,8 +271,9 @@ pub fn Reader(
             buf_size: usize = 512,
         };
 
+        // `num_bytes` is a `u64` to match `off_t`
         /// Reads `num_bytes` bytes from the stream and discards them
-        pub fn skipBytes(self: Self, num_bytes: usize, comptime options: SkipBytesOptions) !void {
+        pub fn skipBytes(self: Self, num_bytes: u64, comptime options: SkipBytesOptions) !void {
             var buf: [options.buf_size]u8 = undefined;
             var remaining = num_bytes;
 

@@ -41,7 +41,7 @@ fn renderRoot(
     for (tree.token_ids) |token_id, i| {
         if (token_id != .LineComment) break;
         const token_loc = tree.token_locs[i];
-        try ais.writer().print("{}\n", .{mem.trimRight(u8, tree.tokenSliceLoc(token_loc), " ")});
+        try ais.writer().print("{s}\n", .{mem.trimRight(u8, tree.tokenSliceLoc(token_loc), " ")});
         const next_token = tree.token_locs[i + 1];
         const loc = tree.tokenLocationLoc(token_loc.end, next_token);
         if (loc.line >= 2) {
@@ -228,7 +228,8 @@ fn renderContainerDecl(allocator: *mem.Allocator, ais: anytype, tree: *ast.Tree,
 
             try renderDocComments(tree, ais, test_decl, test_decl.doc_comments);
             try renderToken(tree, ais, test_decl.test_token, .Space);
-            try renderExpression(allocator, ais, tree, test_decl.name, .Space);
+            if (test_decl.name) |name|
+                try renderExpression(allocator, ais, tree, name, .Space);
             try renderExpression(allocator, ais, tree, test_decl.body_node, space);
         },
 
@@ -790,8 +791,8 @@ fn renderExpression(
                         const section_exprs = row_exprs[0..section_end];
 
                         // Null stream for counting the printed length of each expression
-                        var line_find_stream = std.io.findByteOutStream('\n', std.io.null_out_stream);
-                        var counting_stream = std.io.countingOutStream(line_find_stream.writer());
+                        var line_find_stream = std.io.findByteWriter('\n', std.io.null_writer);
+                        var counting_stream = std.io.countingWriter(line_find_stream.writer());
                         var auto_indenting_stream = std.io.autoIndentingStream(indent_delta, counting_stream.writer());
 
                         // Calculate size of columns in current section
@@ -954,7 +955,7 @@ fn renderExpression(
             const expr_outputs_one_line = blk: {
                 // render field expressions until a LF is found
                 for (field_inits) |field_init| {
-                    var find_stream = std.io.findByteOutStream('\n', std.io.null_out_stream);
+                    var find_stream = std.io.findByteWriter('\n', std.io.null_writer);
                     var auto_indenting_stream = std.io.autoIndentingStream(indent_delta, find_stream.writer());
 
                     try renderExpression(allocator, &auto_indenting_stream, tree, field_init, Space.None);
@@ -964,13 +965,13 @@ fn renderExpression(
             };
 
             if (field_inits.len == 1) blk: {
-                const field_init = field_inits[0].cast(ast.Node.FieldInitializer).?;
-
-                switch (field_init.expr.tag) {
-                    .StructInitializer,
-                    .StructInitializerDot,
-                    => break :blk,
-                    else => {},
+                if (field_inits[0].cast(ast.Node.FieldInitializer)) |field_init| {
+                    switch (field_init.expr.tag) {
+                        .StructInitializer,
+                        .StructInitializerDot,
+                        => break :blk,
+                        else => {},
+                    }
                 }
 
                 // if the expression outputs to multiline, make this struct multiline
@@ -983,7 +984,7 @@ fn renderExpression(
                     .node => |node| try renderExpression(allocator, ais, tree, node, Space.None),
                 }
                 try renderToken(tree, ais, lbrace, Space.Space);
-                try renderExpression(allocator, ais, tree, &field_init.base, Space.Space);
+                try renderExpression(allocator, ais, tree, field_inits[0], Space.Space);
                 return renderToken(tree, ais, rtoken, space);
             }
 
@@ -1557,7 +1558,7 @@ fn renderExpression(
             }
 
             if (fn_proto.getExternExportInlineToken()) |extern_export_inline_token| {
-                if (fn_proto.getIsExternPrototype() == null)
+                if (fn_proto.getIsExternPrototype() == null and fn_proto.getIsInline() == null)
                     try renderToken(tree, ais, extern_export_inline_token, Space.Space); // extern/export/inline
             }
 
@@ -1663,6 +1664,8 @@ fn renderExpression(
                 try ais.writer().writeAll("callconv(.C) ");
             } else if (fn_proto.getIsAsync() != null) {
                 try ais.writer().writeAll("callconv(.Async) ");
+            } else if (fn_proto.getIsInline() != null) {
+                try ais.writer().writeAll("callconv(.Inline) ");
             }
 
             switch (fn_proto.return_type) {

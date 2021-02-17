@@ -2504,6 +2504,21 @@ enum ZigClangStringLiteral_StringKind ZigClangStringLiteral_getKind(const struct
     return (ZigClangStringLiteral_StringKind)casted->getKind();
 }
 
+uint32_t ZigClangStringLiteral_getCodeUnit(const struct ZigClangStringLiteral *self, size_t i) {
+    auto casted = reinterpret_cast<const clang::StringLiteral *>(self);
+    return casted->getCodeUnit(i);
+}
+
+unsigned ZigClangStringLiteral_getLength(const struct ZigClangStringLiteral *self) {
+    auto casted = reinterpret_cast<const clang::StringLiteral *>(self);
+    return casted->getLength();
+}
+
+unsigned ZigClangStringLiteral_getCharByteWidth(const struct ZigClangStringLiteral *self) {
+    auto casted = reinterpret_cast<const clang::StringLiteral *>(self);
+    return casted->getCharByteWidth();
+}
+
 const char *ZigClangStringLiteral_getString_bytes_begin_size(const struct ZigClangStringLiteral *self, size_t *len) {
     auto casted = reinterpret_cast<const clang::StringLiteral *>(self);
     llvm::StringRef str_ref = casted->getString();
@@ -2756,6 +2771,11 @@ const struct ZigClangExpr *ZigClangUnaryOperator_getSubExpr(const struct ZigClan
 struct ZigClangSourceLocation ZigClangUnaryOperator_getBeginLoc(const struct ZigClangUnaryOperator *self) {
     auto casted = reinterpret_cast<const clang::UnaryOperator *>(self);
     return bitcast(casted->getBeginLoc());
+}
+
+struct ZigClangQualType ZigClangValueDecl_getType(const struct ZigClangValueDecl *self) {
+    auto casted = reinterpret_cast<const clang::ValueDecl *>(self);
+    return bitcast(casted->getType());
 }
 
 const struct ZigClangExpr *ZigClangWhileStmt_getCond(const struct ZigClangWhileStmt *self) {

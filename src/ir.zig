@@ -56,13 +56,20 @@ pub const Inst = struct {
         alloc,
         arg,
         assembly,
-        bitand,
+        bit_and,
         bitcast,
-        bitor,
+        bit_or,
         block,
         br,
+        /// Same as `br` except the operand is a list of instructions to be treated as
+        /// a flat block; that is there is only 1 break instruction from the block, and
+        /// it is implied to be after the last instruction, and the last instruction is
+        /// the break operand.
+        /// This instruction exists for late-stage semantic analysis patch ups, to
+        /// replace one br operand with multiple instructions, without moving anything else around.
+        br_block_flat,
         breakpoint,
-        brvoid,
+        br_void,
         call,
         cmp_lt,
         cmp_lte,
@@ -73,11 +80,20 @@ pub const Inst = struct {
         condbr,
         constant,
         dbg_stmt,
-        isnonnull,
-        isnull,
-        iserr,
-        booland,
-        boolor,
+        // ?T => bool
+        is_null,
+        // ?T => bool (inverted logic)
+        is_non_null,
+        // *?T => bool
+        is_null_ptr,
+        // *?T => bool (inverted logic)
+        is_non_null_ptr,
+        // E!T => bool
+        is_err,
+        // *E!T => bool
+        is_err_ptr,
+        bool_and,
+        bool_or,
         /// Read a value from a pointer.
         load,
         loop,
@@ -93,7 +109,10 @@ pub const Inst = struct {
         not,
         floatcast,
         intcast,
-        unwrap_optional,
+        // ?T => T
+        optional_payload,
+        // *?T => *T
+        optional_payload_ptr,
         wrap_optional,
         xor,
         switchbr,
@@ -111,14 +130,18 @@ pub const Inst = struct {
                 .ret,
                 .bitcast,
                 .not,
-                .isnonnull,
-                .isnull,
-                .iserr,
+                .is_non_null,
+                .is_non_null_ptr,
+                .is_null,
+                .is_null_ptr,
+                .is_err,
+                .is_err_ptr,
                 .ptrtoint,
                 .floatcast,
                 .intcast,
                 .load,
-                .unwrap_optional,
+                .optional_payload,
+                .optional_payload_ptr,
                 .wrap_optional,
                 => UnOp,
 
@@ -131,10 +154,10 @@ pub const Inst = struct {
                 .cmp_gt,
                 .cmp_neq,
                 .store,
-                .booland,
-                .boolor,
-                .bitand,
-                .bitor,
+                .bool_and,
+                .bool_or,
+                .bit_and,
+                .bit_or,
                 .xor,
                 => BinOp,
 
@@ -142,7 +165,8 @@ pub const Inst = struct {
                 .assembly => Assembly,
                 .block => Block,
                 .br => Br,
-                .brvoid => BrVoid,
+                .br_block_flat => BrBlockFlat,
+                .br_void => BrVoid,
                 .call => Call,
                 .condbr => CondBr,
                 .constant => Constant,
@@ -189,7 +213,7 @@ pub const Inst = struct {
     }
 
     pub fn Args(comptime T: type) type {
-        return std.meta.fieldInfo(T, "args").field_type;
+        return std.meta.fieldInfo(T, .args).field_type;
     }
 
     /// Returns `null` if runtime-known.
@@ -235,7 +259,8 @@ pub const Inst = struct {
     pub fn breakBlock(base: *Inst) ?*Block {
         return switch (base.tag) {
             .br => base.castTag(.br).?.block,
-            .brvoid => base.castTag(.brvoid).?.block,
+            .br_void => base.castTag(.br_void).?.block,
+            .br_block_flat => base.castTag(.br_block_flat).?.block,
             else => null,
         };
     }
@@ -339,6 +364,27 @@ pub const Inst = struct {
         }
     };
 
+    pub const convertable_br_size = std.math.max(@sizeOf(BrBlockFlat), @sizeOf(Br));
+    pub const convertable_br_align = std.math.max(@alignOf(BrBlockFlat), @alignOf(Br));
+    comptime {
+        assert(@byteOffsetOf(BrBlockFlat, "base") == @byteOffsetOf(Br, "base"));
+    }
+
+    pub const BrBlockFlat = struct {
+        pub const base_tag = Tag.br_block_flat;
+
+        base: Inst,
+        block: *Block,
+        body: Body,
+
+        pub fn operandCount(self: *const BrBlockFlat) usize {
+            return 0;
+        }
+        pub fn getOperand(self: *const BrBlockFlat, index: usize) ?*Inst {
+            return null;
+        }
+    };
+
     pub const Br = struct {
         pub const base_tag = Tag.br;
 
@@ -347,7 +393,7 @@ pub const Inst = struct {
         operand: *Inst,
 
         pub fn operandCount(self: *const Br) usize {
-            return 0;
+            return 1;
         }
         pub fn getOperand(self: *const Br, index: usize) ?*Inst {
             if (index == 0)
@@ -357,7 +403,7 @@ pub const Inst = struct {
     };
 
     pub const BrVoid = struct {
-        pub const base_tag = Tag.brvoid;
+        pub const base_tag = Tag.br_void;
 
         base: Inst,
         block: *Block,
@@ -475,7 +521,7 @@ pub const Inst = struct {
         pub const base_tag = Tag.switchbr;
 
         base: Inst,
-        target_ptr: *Inst,
+        target: *Inst,
         cases: []Case,
         /// Set of instructions whose lifetimes end at the start of one of the cases.
         /// In same order as cases, deaths[0..case_0_count, case_0_count .. case_1_count, ... ].
@@ -498,7 +544,7 @@ pub const Inst = struct {
             var i = index;
 
             if (i < 1)
-                return self.target_ptr;
+                return self.target;
             i -= 1;
 
             return null;

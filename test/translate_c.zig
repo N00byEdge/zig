@@ -43,7 +43,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         ,
         \\pub const VALUE = ((((1 + (2 * 3)) + (4 * 5)) + 6) << 7) | @boolToInt(8 == 9);
         ,
-        \\pub inline fn _AL_READ3BYTES(p: anytype) @TypeOf(((@import("std").meta.cast([*c]u8, p)).* | (((@import("std").meta.cast([*c]u8, p)) + 1).* << 8)) | (((@import("std").meta.cast([*c]u8, p)) + 2).* << 16)) {
+        \\pub fn _AL_READ3BYTES(p: anytype) callconv(.Inline) @TypeOf(((@import("std").meta.cast([*c]u8, p)).* | (((@import("std").meta.cast([*c]u8, p)) + 1).* << 8)) | (((@import("std").meta.cast([*c]u8, p)) + 2).* << 16)) {
         \\    return ((@import("std").meta.cast([*c]u8, p)).* | (((@import("std").meta.cast([*c]u8, p)) + 1).* << 8)) | (((@import("std").meta.cast([*c]u8, p)) + 2).* << 16);
         \\}
     });
@@ -102,6 +102,11 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\} Color;
         \\#define CLITERAL(type)      (type)
         \\#define LIGHTGRAY  CLITERAL(Color){ 200, 200, 200, 255 }   // Light Gray
+        \\typedef struct boom_t
+        \\{
+        \\    int i1;
+        \\} boom_t;
+        \\#define FOO ((boom_t){1})
     , &[_][]const u8{ // TODO properly translate this
         \\pub const struct_Color = extern struct {
         \\    r: u8,
@@ -111,11 +116,18 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\};
         \\pub const Color = struct_Color;
         ,
-        \\pub inline fn CLITERAL(type_1: anytype) @TypeOf(type_1) {
+        \\pub fn CLITERAL(type_1: anytype) callconv(.Inline) @TypeOf(type_1) {
         \\    return type_1;
         \\}
         ,
         \\pub const LIGHTGRAY = @import("std").mem.zeroInit(CLITERAL(Color), .{ 200, 200, 200, 255 });
+        ,
+        \\pub const struct_boom_t = extern struct {
+        \\    i1: c_int,
+        \\};
+        \\pub const boom_t = struct_boom_t;
+        ,
+        \\pub const FOO = @import("std").mem.zeroInit(boom_t, .{ 1 });
     });
 
     cases.add("complex switch",
@@ -136,7 +148,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
     cases.add("correct semicolon after infixop",
         \\#define __ferror_unlocked_body(_fp) (((_fp)->_flags & _IO_ERR_SEEN) != 0)
     , &[_][]const u8{
-        \\pub inline fn __ferror_unlocked_body(_fp: anytype) @TypeOf(((_fp.*._flags) & _IO_ERR_SEEN) != 0) {
+        \\pub fn __ferror_unlocked_body(_fp: anytype) callconv(.Inline) @TypeOf(((_fp.*._flags) & _IO_ERR_SEEN) != 0) {
         \\    return ((_fp.*._flags) & _IO_ERR_SEEN) != 0;
         \\}
     });
@@ -145,7 +157,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\#define FOO(x) ((x >= 0) + (x >= 0))
         \\#define BAR 1 && 2 > 4
     , &[_][]const u8{
-        \\pub inline fn FOO(x: anytype) @TypeOf(@boolToInt(x >= 0) + @boolToInt(x >= 0)) {
+        \\pub fn FOO(x: anytype) callconv(.Inline) @TypeOf(@boolToInt(x >= 0) + @boolToInt(x >= 0)) {
         \\    return @boolToInt(x >= 0) + @boolToInt(x >= 0);
         \\}
         ,
@@ -196,7 +208,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\    break :blk bar;
         \\};
         ,
-        \\pub inline fn bar(x: anytype) @TypeOf(baz(1, 2)) {
+        \\pub fn bar(x: anytype) callconv(.Inline) @TypeOf(baz(1, 2)) {
         \\    return blk: {
         \\        _ = &x;
         \\        _ = 3;
@@ -539,7 +551,14 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\    static const char v2[] = "2.2.2";
         \\}
     , &[_][]const u8{
-        \\const v2: [*c]const u8 = "2.2.2";
+        \\const v2: [6]u8 = [6]u8{
+        \\    '2',
+        \\    '.',
+        \\    '2',
+        \\    '.',
+        \\    '2',
+        \\    0,
+        \\};
         \\pub export fn foo() void {
         \\    _ = v2;
         \\}
@@ -1286,10 +1305,10 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\    var a: c_int = undefined;
         \\    var b: f32 = undefined;
         \\    var c: ?*c_void = undefined;
-        \\    return !(a == @as(c_int, 0));
-        \\    return !(a != 0);
-        \\    return !(b != 0);
-        \\    return !(c != null);
+        \\    return @boolToInt(!(a == @as(c_int, 0)));
+        \\    return @boolToInt(!(a != 0));
+        \\    return @boolToInt(!(b != 0));
+        \\    return @boolToInt(!(c != null));
         \\}
     });
 
@@ -1375,11 +1394,19 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\void b(void) {}
         \\void c();
         \\void d(void);
+        \\static void e() {}
+        \\static void f(void) {}
+        \\static void g();
+        \\static void h(void);
     , &[_][]const u8{
         \\pub export fn a() void {}
         \\pub export fn b() void {}
         \\pub extern fn c(...) void;
         \\pub extern fn d() void;
+        \\pub fn e() callconv(.C) void {}
+        \\pub fn f() callconv(.C) void {}
+        \\pub extern fn g() void;
+        \\pub extern fn h() void;
     });
 
     cases.add("variable declarations",
@@ -1387,9 +1414,30 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\static char arr1[] = "hello";
         \\char arr2[] = "hello";
     , &[_][]const u8{
-        \\pub export var arr0: [*c]u8 = "hello";
-        \\pub var arr1: [*c]u8 = "hello";
-        \\pub export var arr2: [*c]u8 = "hello";
+        \\pub export var arr0: [6]u8 = [6]u8{
+        \\    'h',
+        \\    'e',
+        \\    'l',
+        \\    'l',
+        \\    'o',
+        \\    0,
+        \\};
+        \\pub var arr1: [6]u8 = [6]u8{
+        \\    'h',
+        \\    'e',
+        \\    'l',
+        \\    'l',
+        \\    'o',
+        \\    0,
+        \\};
+        \\pub export var arr2: [6]u8 = [6]u8{
+        \\    'h',
+        \\    'e',
+        \\    'l',
+        \\    'l',
+        \\    'o',
+        \\    0,
+        \\};
     });
 
     cases.add("array initializer expr",
@@ -1542,13 +1590,13 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
     , &[_][]const u8{
         \\pub extern var fn_ptr: ?fn () callconv(.C) void;
         ,
-        \\pub inline fn foo() void {
+        \\pub fn foo() callconv(.Inline) void {
         \\    return fn_ptr.?();
         \\}
         ,
         \\pub extern var fn_ptr2: ?fn (c_int, f32) callconv(.C) u8;
         ,
-        \\pub inline fn bar(arg_1: c_int, arg_2: f32) u8 {
+        \\pub fn bar(arg_1: c_int, arg_2: f32) callconv(.Inline) u8 {
         \\    return fn_ptr2.?(arg_1, arg_2);
         \\}
     });
@@ -1581,7 +1629,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         ,
         \\pub const glClearPFN = PFNGLCLEARPROC;
         ,
-        \\pub inline fn glClearUnion(arg_2: GLbitfield) void {
+        \\pub fn glClearUnion(arg_2: GLbitfield) callconv(.Inline) void {
         \\    return glProcs.gl.Clear.?(arg_2);
         \\}
         ,
@@ -1602,15 +1650,15 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
     , &[_][]const u8{
         \\pub extern var c: c_int;
         ,
-        \\pub inline fn BASIC(c_1: anytype) @TypeOf(c_1 * 2) {
+        \\pub fn BASIC(c_1: anytype) callconv(.Inline) @TypeOf(c_1 * 2) {
         \\    return c_1 * 2;
         \\}
         ,
-        \\pub inline fn FOO(L: anytype, b: anytype) @TypeOf(L + b) {
+        \\pub fn FOO(L: anytype, b: anytype) callconv(.Inline) @TypeOf(L + b) {
         \\    return L + b;
         \\}
         ,
-        \\pub inline fn BAR() @TypeOf(c * c) {
+        \\pub fn BAR() callconv(.Inline) @TypeOf(c * c) {
         \\    return c * c;
         \\}
     });
@@ -1675,11 +1723,17 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\}
     , &[_][]const u8{
         \\pub export fn foo() c_int {
-        \\    _ = @as(c_int, 2);
-        \\    _ = @as(c_int, 4);
-        \\    _ = @as(c_int, 2);
-        \\    _ = @as(c_int, 4);
-        \\    return @as(c_int, 6);
+        \\    _ = (blk: {
+        \\        _ = @as(c_int, 2);
+        \\        break :blk @as(c_int, 4);
+        \\    });
+        \\    return (blk: {
+        \\        _ = (blk_1: {
+        \\            _ = @as(c_int, 2);
+        \\            break :blk_1 @as(c_int, 4);
+        \\        });
+        \\        break :blk @as(c_int, 6);
+        \\    });
         \\}
     });
 
@@ -1726,8 +1780,10 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\    while (true) {
         \\        var a_1: c_int = 4;
         \\        a_1 = 9;
-        \\        _ = @as(c_int, 6);
-        \\        return a_1;
+        \\        return (blk: {
+        \\            _ = @as(c_int, 6);
+        \\            break :blk a_1;
+        \\        });
         \\    }
         \\    while (true) {
         \\        var a_1: c_int = 2;
@@ -1757,9 +1813,13 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\        var b: c_int = 4;
         \\        while ((i + @as(c_int, 2)) != 0) : (i = 2) {
         \\            var a: c_int = 2;
-        \\            a = 6;
-        \\            _ = @as(c_int, 5);
-        \\            _ = @as(c_int, 7);
+        \\            _ = (blk: {
+        \\                _ = (blk_1: {
+        \\                    a = 6;
+        \\                    break :blk_1 @as(c_int, 5);
+        \\                });
+        \\                break :blk @as(c_int, 7);
+        \\            });
         \\        }
         \\    }
         \\    var i: u8 = @bitCast(u8, @truncate(i8, @as(c_int, 2)));
@@ -2250,7 +2310,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
     cases.add("macro call",
         \\#define CALL(arg) bar(arg)
     , &[_][]const u8{
-        \\pub inline fn CALL(arg: anytype) @TypeOf(bar(arg)) {
+        \\pub fn CALL(arg: anytype) callconv(.Inline) @TypeOf(bar(arg)) {
         \\    return bar(arg);
         \\}
     });
@@ -2754,8 +2814,8 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\    fn_f64(3);
         \\    fn_bool(@as(c_int, 123) != 0);
         \\    fn_bool(@as(c_int, 0) != 0);
-        \\    fn_bool(@ptrToInt(&fn_int) != 0);
-        \\    fn_int(@intCast(c_int, @ptrToInt(&fn_int)));
+        \\    fn_bool(@ptrToInt(fn_int) != 0);
+        \\    fn_int(@intCast(c_int, @ptrToInt(fn_int)));
         \\    fn_ptr(@intToPtr(?*c_void, @as(c_int, 42)));
         \\}
     });
@@ -2812,7 +2872,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\#define BAR (void*) a
         \\#define BAZ (uint32_t)(2)
     , &[_][]const u8{
-        \\pub inline fn FOO(bar: anytype) @TypeOf(baz((@import("std").meta.cast(?*c_void, baz)))) {
+        \\pub fn FOO(bar: anytype) callconv(.Inline) @TypeOf(baz((@import("std").meta.cast(?*c_void, baz)))) {
         \\    return baz((@import("std").meta.cast(?*c_void, baz)));
         \\}
         ,
@@ -2854,11 +2914,11 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\#define MIN(a, b) ((b) < (a) ? (b) : (a))
         \\#define MAX(a, b) ((b) > (a) ? (b) : (a))
     , &[_][]const u8{
-        \\pub inline fn MIN(a: anytype, b: anytype) @TypeOf(if (b < a) b else a) {
+        \\pub fn MIN(a: anytype, b: anytype) callconv(.Inline) @TypeOf(if (b < a) b else a) {
         \\    return if (b < a) b else a;
         \\}
         ,
-        \\pub inline fn MAX(a: anytype, b: anytype) @TypeOf(if (b > a) b else a) {
+        \\pub fn MAX(a: anytype, b: anytype) callconv(.Inline) @TypeOf(if (b > a) b else a) {
         \\    return if (b > a) b else a;
         \\}
     });
@@ -2938,7 +2998,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\pub fn a() callconv(.C) void {}
         \\pub fn b() callconv(.C) void {}
         \\pub export fn c() void {}
-        \\pub fn foo(...) callconv(.C) void {}
+        \\pub fn foo() callconv(.C) void {}
     });
 
     cases.add("casting away const and volatile",
@@ -3046,7 +3106,7 @@ pub fn addCases(cases: *tests.TranslateCContext) void {
         \\#define DefaultScreen(dpy) (((_XPrivDisplay)(dpy))->default_screen)
         \\
     , &[_][]const u8{
-        \\pub inline fn DefaultScreen(dpy: anytype) @TypeOf((@import("std").meta.cast(_XPrivDisplay, dpy)).*.default_screen) {
+        \\pub fn DefaultScreen(dpy: anytype) callconv(.Inline) @TypeOf((@import("std").meta.cast(_XPrivDisplay, dpy)).*.default_screen) {
         \\    return (@import("std").meta.cast(_XPrivDisplay, dpy)).*.default_screen;
         \\}
     });

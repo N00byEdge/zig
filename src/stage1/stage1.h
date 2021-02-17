@@ -178,6 +178,7 @@ struct ZigStage1 {
 
     bool pic;
     bool pie;
+    bool lto;
     bool link_libc;
     bool link_libcpp;
     bool strip;
@@ -188,6 +189,7 @@ struct ZigStage1 {
     bool tsan_enabled;
     bool function_sections;
     bool enable_stack_probing;
+    bool red_zone;
     bool enable_time_report;
     bool enable_stack_report;
     bool test_is_evented;

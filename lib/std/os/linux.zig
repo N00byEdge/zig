@@ -126,7 +126,7 @@ pub fn fork() usize {
 /// It is advised to avoid this function and use clone instead, because
 /// the compiler is not aware of how vfork affects control flow and you may
 /// see different results in optimized builds.
-pub inline fn vfork() usize {
+pub fn vfork() callconv(.Inline) usize {
     return @call(.{ .modifier = .always_inline }, syscall0, .{.vfork});
 }
 
@@ -1355,7 +1355,7 @@ pub fn madvise(address: [*]u8, len: usize, advice: u32) usize {
     return syscall3(.madvise, @ptrToInt(address), len, advice);
 }
 
-test "" {
+test {
     if (builtin.os.tag == .linux) {
         _ = @import("linux/test.zig");
     }

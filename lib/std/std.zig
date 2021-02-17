@@ -13,7 +13,6 @@ pub const AutoArrayHashMap = array_hash_map.AutoArrayHashMap;
 pub const AutoArrayHashMapUnmanaged = array_hash_map.AutoArrayHashMapUnmanaged;
 pub const AutoHashMap = hash_map.AutoHashMap;
 pub const AutoHashMapUnmanaged = hash_map.AutoHashMapUnmanaged;
-pub const AutoResetEvent = @import("auto_reset_event.zig").AutoResetEvent;
 pub const BufMap = @import("buf_map.zig").BufMap;
 pub const BufSet = @import("buf_set.zig").BufSet;
 pub const ChildProcess = @import("child_process.zig").ChildProcess;
@@ -21,26 +20,21 @@ pub const ComptimeStringMap = @import("comptime_string_map.zig").ComptimeStringM
 pub const DynLib = @import("dynamic_library.zig").DynLib;
 pub const HashMap = hash_map.HashMap;
 pub const HashMapUnmanaged = hash_map.HashMapUnmanaged;
-pub const mutex = @import("mutex.zig");
-pub const Mutex = mutex.Mutex;
 pub const PackedIntArray = @import("packed_int_array.zig").PackedIntArray;
 pub const PackedIntArrayEndian = @import("packed_int_array.zig").PackedIntArrayEndian;
 pub const PackedIntSlice = @import("packed_int_array.zig").PackedIntSlice;
 pub const PackedIntSliceEndian = @import("packed_int_array.zig").PackedIntSliceEndian;
 pub const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 pub const Progress = @import("Progress.zig");
-pub const ResetEvent = @import("ResetEvent.zig");
 pub const SemanticVersion = @import("SemanticVersion.zig");
 pub const SinglyLinkedList = @import("linked_list.zig").SinglyLinkedList;
-pub const SpinLock = @import("spinlock.zig").SpinLock;
-pub const StaticResetEvent = @import("StaticResetEvent.zig");
 pub const StringHashMap = hash_map.StringHashMap;
 pub const StringHashMapUnmanaged = hash_map.StringHashMapUnmanaged;
 pub const StringArrayHashMap = array_hash_map.StringArrayHashMap;
 pub const StringArrayHashMapUnmanaged = array_hash_map.StringArrayHashMapUnmanaged;
 pub const TailQueue = @import("linked_list.zig").TailQueue;
 pub const Target = @import("target.zig").Target;
-pub const Thread = @import("thread.zig").Thread;
+pub const Thread = @import("Thread.zig");
 
 pub const array_hash_map = @import("array_hash_map.zig");
 pub const atomic = @import("atomic.zig");
@@ -83,6 +77,7 @@ pub const testing = @import("testing.zig");
 pub const time = @import("time.zig");
 pub const unicode = @import("unicode.zig");
 pub const valgrind = @import("valgrind.zig");
+pub const wasm = @import("wasm.zig");
 pub const zig = @import("zig.zig");
 pub const start = @import("start.zig");
 
@@ -92,6 +87,37 @@ comptime {
     _ = start;
 }
 
-test "" {
-    testing.refAllDecls(@This());
+test {
+    if (builtin.os.tag == .windows) {
+        // We only test the Windows-relevant stuff to save memory because the CI
+        // server is hitting OOM. TODO revert this after stage2 arrives.
+        _ = ChildProcess;
+        _ = DynLib;
+        _ = Progress;
+        _ = Target;
+        _ = Thread;
+
+        _ = atomic;
+        _ = build;
+        _ = builtin;
+        _ = debug;
+        _ = event;
+        _ = fs;
+        _ = heap;
+        _ = io;
+        _ = log;
+        _ = macho;
+        _ = net;
+        _ = os;
+        _ = once;
+        _ = pdb;
+        _ = process;
+        _ = testing;
+        _ = time;
+        _ = unicode;
+        _ = zig;
+        _ = start;
+    } else {
+        testing.refAllDecls(@This());
+    }
 }

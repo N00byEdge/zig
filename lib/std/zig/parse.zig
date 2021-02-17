@@ -366,9 +366,7 @@ const Parser = struct {
     /// TestDecl <- KEYWORD_test STRINGLITERALSINGLE Block
     fn parseTestDecl(p: *Parser) !?*Node {
         const test_token = p.eatToken(.Keyword_test) orelse return null;
-        const name_node = try p.expectNode(parseStringLiteralSingle, .{
-            .ExpectedStringLiteral = .{ .token = p.tok_i },
-        });
+        const name_node = try p.parseStringLiteralSingle();
         const block_node = (try p.parseBlock(null)) orelse {
             try p.errors.append(p.gpa, .{ .ExpectedLBrace = .{ .token = p.tok_i } });
             return error.ParseError;
@@ -495,9 +493,15 @@ const Parser = struct {
         extern_export_inline_token: ?TokenIndex = null,
         lib_name: ?*Node = null,
     }) !?*Node {
-        // TODO: Remove once extern/async fn rewriting is
-        var is_async: ?void = null;
+        // TODO: Remove once extern/async/inline fn rewriting is
         var is_extern_prototype: ?void = null;
+        var is_async: ?void = null;
+        var is_inline: ?void = null;
+        if (fields.extern_export_inline_token != null and
+            p.token_ids[fields.extern_export_inline_token.?] == .Keyword_inline)
+        {
+            is_inline = {};
+        }
         const cc_token: ?TokenIndex = blk: {
             if (p.eatToken(.Keyword_extern)) |token| {
                 is_extern_prototype = {};
@@ -575,6 +579,7 @@ const Parser = struct {
             .callconv_expr = callconv_expr,
             .is_extern_prototype = is_extern_prototype,
             .is_async = is_async,
+            .is_inline = is_inline,
         });
         std.mem.copy(Node.FnProto.ParamDecl, fn_proto_node.params(), params);
 

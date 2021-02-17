@@ -131,7 +131,7 @@ pub const Token = struct {
         Keyword_error,
         Keyword_pragma,
 
-        pub fn symbol(id: @TagType(Id)) []const u8 {
+        pub fn symbol(id: std.meta.TagType(Id)) []const u8 {
             return switch (id) {
                 .Invalid => "Invalid",
                 .Eof => "Eof",
@@ -347,7 +347,7 @@ pub const Token = struct {
 pub const Tokenizer = struct {
     buffer: []const u8,
     index: usize = 0,
-    prev_tok_id: @TagType(Token.Id) = .Invalid,
+    prev_tok_id: std.meta.TagType(Token.Id) = .Invalid,
     pp_directive: bool = false,
 
     pub fn next(self: *Tokenizer) Token {
@@ -446,7 +446,7 @@ pub const Tokenizer = struct {
                     'L' => {
                         state = .L;
                     },
-                    'a'...'t', 'v'...'z', 'A'...'K', 'M'...'T', 'V'...'Z', '_' => {
+                    'a'...'t', 'v'...'z', 'A'...'K', 'M'...'T', 'V'...'Z', '_', '$' => {
                         state = .Identifier;
                     },
                     '=' => {
@@ -776,7 +776,7 @@ pub const Tokenizer = struct {
                     },
                 },
                 .Identifier => switch (c) {
-                    'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                    'a'...'z', 'A'...'Z', '_', '0'...'9', '$' => {},
                     else => {
                         result.id = Token.getKeyword(self.buffer[result.start..self.index], self.prev_tok_id == .Hash and !self.pp_directive) orelse .Identifier;
                         if (self.prev_tok_id == .Hash)
@@ -1552,7 +1552,7 @@ fn expectTokens(source: []const u8, expected_tokens: []const Token.Id) void {
     for (expected_tokens) |expected_token_id| {
         const token = tokenizer.next();
         if (!std.meta.eql(token.id, expected_token_id)) {
-            std.debug.panic("expected {}, found {}\n", .{ @tagName(expected_token_id), @tagName(token.id) });
+            std.debug.panic("expected {s}, found {s}\n", .{ @tagName(expected_token_id), @tagName(token.id) });
         }
     }
     const last_token = tokenizer.next();

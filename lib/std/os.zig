@@ -43,7 +43,7 @@ comptime {
     assert(@import("std") == std); // std lib tests require --override-lib-dir
 }
 
-test "" {
+test {
     _ = darwin;
     _ = freebsd;
     _ = linux;
@@ -191,7 +191,7 @@ fn getRandomBytesDevURandom(buf: []u8) !void {
         .capable_io_mode = .blocking,
         .intended_io_mode = .blocking,
     };
-    const stream = file.inStream();
+    const stream = file.reader();
     stream.readNoEof(buf) catch return error.Unexpected;
 }
 
@@ -324,7 +324,7 @@ pub const ReadError = error{
 /// on both 64-bit and 32-bit systems. This is due to using a signed C int as the return value, as
 /// well as stuffing the errno codes into the last `4096` values. This is noted on the `read` man page.
 /// The limit on Darwin is `0x7fffffff`, trying to read more than that returns EINVAL.
-/// For POSIX the limit is `math.maxInt(isize)`.
+/// The corresponding POSIX limit is `math.maxInt(isize)`.
 pub fn read(fd: fd_t, buf: []u8) ReadError!usize {
     if (builtin.os.tag == .windows) {
         return windows.ReadFile(fd, buf, null, std.io.default_mode);
@@ -447,6 +447,12 @@ pub const PReadError = ReadError || error{Unseekable};
 /// return error.WouldBlock when EAGAIN is received.
 /// On Windows, if the application has a global event loop enabled, I/O Completion Ports are
 /// used to perform the I/O. `error.WouldBlock` is not possible on Windows.
+///
+/// Linux has a limit on how many bytes may be transferred in one `pread` call, which is `0x7ffff000`
+/// on both 64-bit and 32-bit systems. This is due to using a signed C int as the return value, as
+/// well as stuffing the errno codes into the last `4096` values. This is noted on the `read` man page.
+/// The limit on Darwin is `0x7fffffff`, trying to read more than that returns EINVAL.
+/// The corresponding POSIX limit is `math.maxInt(isize)`.
 pub fn pread(fd: fd_t, buf: []u8, offset: u64) PReadError!usize {
     if (builtin.os.tag == .windows) {
         return windows.ReadFile(fd, buf, offset, std.io.default_mode);
@@ -478,8 +484,16 @@ pub fn pread(fd: fd_t, buf: []u8, offset: u64) PReadError!usize {
         }
     }
 
+    // Prevent EINVAL.
+    const max_count = switch (std.Target.current.os.tag) {
+        .linux => 0x7ffff000,
+        .macos, .ios, .watchos, .tvos => math.maxInt(i32),
+        else => math.maxInt(isize),
+    };
+    const adjusted_len = math.min(max_count, buf.len);
+
     while (true) {
-        const rc = system.pread(fd, buf.ptr, buf.len, offset);
+        const rc = system.pread(fd, buf.ptr, adjusted_len, offset);
         switch (errno(rc)) {
             0 => return @intCast(usize, rc),
             EINTR => continue,
@@ -3146,6 +3160,9 @@ pub const ConnectError = error{
 
     /// The given path for the unix socket does not exist.
     FileNotFound,
+
+    /// Connection was reset by peer before connect could complete.
+    ConnectionResetByPeer,
 } || UnexpectedError;
 
 /// Initiate a connection on a socket.
@@ -3223,6 +3240,7 @@ pub fn getsockoptError(sockfd: fd_t) ConnectError!void {
             ENOTSOCK => unreachable, // The file descriptor sockfd does not refer to a socket.
             EPROTOTYPE => unreachable, // The socket type does not support the requested communications protocol.
             ETIMEDOUT => return error.ConnectionTimedOut,
+            ECONNRESET => return error.ConnectionResetByPeer,
             else => |err| return unexpectedErrno(err),
         },
         EBADF => unreachable, // The argument sockfd is not a valid file descriptor.
@@ -3751,31 +3769,54 @@ pub fn pipe() PipeError![2]fd_t {
 }
 
 pub fn pipe2(flags: u32) PipeError![2]fd_t {
-    if (comptime std.Target.current.isDarwin()) {
-        var fds: [2]fd_t = try pipe();
-        if (flags == 0) return fds;
-        errdefer {
-            close(fds[0]);
-            close(fds[1]);
-        }
-        for (fds) |fd| switch (errno(system.fcntl(fd, F_SETFL, flags))) {
-            0 => {},
+    if (@hasDecl(system, "pipe2")) {
+        var fds: [2]fd_t = undefined;
+        switch (errno(system.pipe2(&fds, flags))) {
+            0 => return fds,
             EINVAL => unreachable, // Invalid flags
-            EBADF => unreachable, // Always a race condition
+            EFAULT => unreachable, // Invalid fds pointer
+            ENFILE => return error.SystemFdQuotaExceeded,
+            EMFILE => return error.ProcessFdQuotaExceeded,
             else => |err| return unexpectedErrno(err),
-        };
-        return fds;
+        }
     }
 
-    var fds: [2]fd_t = undefined;
-    switch (errno(system.pipe2(&fds, flags))) {
-        0 => return fds,
-        EINVAL => unreachable, // Invalid flags
-        EFAULT => unreachable, // Invalid fds pointer
-        ENFILE => return error.SystemFdQuotaExceeded,
-        EMFILE => return error.ProcessFdQuotaExceeded,
-        else => |err| return unexpectedErrno(err),
+    var fds: [2]fd_t = try pipe();
+    errdefer {
+        close(fds[0]);
+        close(fds[1]);
     }
+
+    if (flags == 0)
+        return fds;
+
+    // O_CLOEXEC is special, it's a file descriptor flag and must be set using
+    // F_SETFD.
+    if (flags & O_CLOEXEC != 0) {
+        for (fds) |fd| {
+            switch (errno(system.fcntl(fd, F_SETFD, @as(u32, FD_CLOEXEC)))) {
+                0 => {},
+                EINVAL => unreachable, // Invalid flags
+                EBADF => unreachable, // Always a race condition
+                else => |err| return unexpectedErrno(err),
+            }
+        }
+    }
+
+    const new_flags = flags & ~@as(u32, O_CLOEXEC);
+    // Set every other flag affecting the file status using F_SETFL.
+    if (new_flags != 0) {
+        for (fds) |fd| {
+            switch (errno(system.fcntl(fd, F_SETFL, new_flags))) {
+                0 => {},
+                EINVAL => unreachable, // Invalid flags
+                EBADF => unreachable, // Always a race condition
+                else => |err| return unexpectedErrno(err),
+            }
+        }
+    }
+
+    return fds;
 }
 
 pub const SysCtlError = error{
@@ -4256,7 +4297,7 @@ pub fn getFdPath(fd: fd_t, out_buffer: *[MAX_PATH_BYTES]u8) RealPathError![]u8 {
         },
         .linux => {
             var procfs_buf: ["/proc/self/fd/-2147483648".len:0]u8 = undefined;
-            const proc_path = std.fmt.bufPrint(procfs_buf[0..], "/proc/self/fd/{}\x00", .{fd}) catch unreachable;
+            const proc_path = std.fmt.bufPrint(procfs_buf[0..], "/proc/self/fd/{d}\x00", .{fd}) catch unreachable;
 
             const target = readlinkZ(std.meta.assumeSentinel(proc_path.ptr, 0), out_buffer) catch |err| {
                 switch (err) {
@@ -4487,7 +4528,7 @@ pub const UnexpectedError = error{
 /// and you get an unexpected error.
 pub fn unexpectedErrno(err: usize) UnexpectedError {
     if (unexpected_error_tracing) {
-        std.debug.warn("unexpected errno: {}\n", .{err});
+        std.debug.warn("unexpected errno: {d}\n", .{err});
         std.debug.dumpCurrentStackTrace(null);
     }
     return error.Unexpected;
@@ -4853,6 +4894,7 @@ pub fn send(
         error.NotDir => unreachable,
         error.NetworkUnreachable => unreachable,
         error.AddressNotAvailable => unreachable,
+        error.SocketNotConnected => unreachable,
         else => |e| return e,
     };
 }
@@ -4898,7 +4940,7 @@ fn count_iovec_bytes(iovs: []const iovec_const) usize {
 ///
 /// Linux has a limit on how many bytes may be transferred in one `sendfile` call, which is `0x7ffff000`
 /// on both 64-bit and 32-bit systems. This is due to using a signed C int as the return value, as
-/// well as stuffing the errno codes into the last `4096` values. This is cited on the `sendfile` man page.
+/// well as stuffing the errno codes into the last `4096` values. This is noted on the `sendfile` man page.
 /// The limit on Darwin is `0x7fffffff`, trying to write more than that returns EINVAL.
 /// The corresponding POSIX limit on this is `math.maxInt(isize)`.
 pub fn sendfile(
@@ -5481,6 +5523,9 @@ pub const SetSockOptError = error{
     /// Insufficient resources are available in the system to complete the call.
     SystemResources,
 
+    // Setting the socket option requires more elevated permissions.
+    PermissionDenied,
+
     NetworkSubsystemFailed,
     FileDescriptorNotASocket,
     SocketNotBound,
@@ -5513,6 +5558,7 @@ pub fn setsockopt(fd: socket_t, level: u32, optname: u32, opt: []const u8) SetSo
             ENOPROTOOPT => return error.InvalidProtocolOption,
             ENOMEM => return error.SystemResources,
             ENOBUFS => return error.SystemResources,
+            EPERM => return error.PermissionDenied,
             else => |err| return unexpectedErrno(err),
         }
     }

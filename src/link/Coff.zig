@@ -16,7 +16,7 @@ const link = @import("../link.zig");
 const build_options = @import("build_options");
 const Cache = @import("../Cache.zig");
 const mingw = @import("../mingw.zig");
-const llvm_backend = @import("../llvm_backend.zig");
+const llvm_backend = @import("../codegen/llvm.zig");
 
 const allocation_padding = 4 / 3;
 const minimum_text_block_size = 64 * allocation_padding;
@@ -662,11 +662,15 @@ pub fn updateDecl(self: *Coff, module: *Module, decl: *Module.Decl) !void {
     if (build_options.have_llvm)
         if (self.llvm_ir_module) |llvm_ir_module| return try llvm_ir_module.updateDecl(module, decl);
 
+    const typed_value = decl.typed_value.most_recent.typed_value;
+    if (typed_value.val.tag() == .extern_fn) {
+        return; // TODO Should we do more when front-end analyzed extern decl?
+    }
+
     var code_buffer = std.ArrayList(u8).init(self.base.allocator);
     defer code_buffer.deinit();
 
-    const typed_value = decl.typed_value.most_recent.typed_value;
-    const res = try codegen.generateSymbol(&self.base, decl.src(), typed_value, &code_buffer, .none);
+    const res = try codegen.generateSymbol(&self.base, decl.srcLoc(), typed_value, &code_buffer, .none);
     const code = switch (res) {
         .externally_managed => |x| x,
         .appended => code_buffer.items,
@@ -686,7 +690,7 @@ pub fn updateDecl(self: *Coff, module: *Module, decl: *Module.Decl) !void {
         if (need_realloc) {
             const curr_vaddr = self.getDeclVAddr(decl);
             const vaddr = try self.growTextBlock(&decl.link.coff, code.len, required_alignment);
-            log.debug("growing {} from 0x{x} to 0x{x}\n", .{ decl.name, curr_vaddr, vaddr });
+            log.debug("growing {s} from 0x{x} to 0x{x}\n", .{ decl.name, curr_vaddr, vaddr });
             if (vaddr != curr_vaddr) {
                 log.debug("  (writing new offset table entry)\n", .{});
                 self.offset_table.items[decl.link.coff.offset_table_index] = vaddr;
@@ -697,7 +701,7 @@ pub fn updateDecl(self: *Coff, module: *Module, decl: *Module.Decl) !void {
         }
     } else {
         const vaddr = try self.allocateTextBlock(&decl.link.coff, code.len, required_alignment);
-        log.debug("allocated text block for {} at 0x{x} (size: {Bi})\n", .{ mem.spanZ(decl.name), vaddr, code.len });
+        log.debug("allocated text block for {s} at 0x{x} (size: {Bi})\n", .{ mem.spanZ(decl.name), vaddr, code.len });
         errdefer self.freeTextBlock(&decl.link.coff);
         self.offset_table.items[decl.link.coff.offset_table_index] = vaddr;
         try self.writeOffsetTableEntry(decl.link.coff.offset_table_index);
@@ -728,7 +732,7 @@ pub fn updateDeclExports(self: *Coff, module: *Module, decl: *const Module.Decl,
                 try module.failed_exports.ensureCapacity(module.gpa, module.failed_exports.items().len + 1);
                 module.failed_exports.putAssumeCapacityNoClobber(
                     exp,
-                    try Compilation.ErrorMsg.create(self.base.allocator, 0, "Unimplemented: ExportOptions.section", .{}),
+                    try Module.ErrorMsg.create(self.base.allocator, decl.srcLoc(), "Unimplemented: ExportOptions.section", .{}),
                 );
                 continue;
             }
@@ -739,7 +743,7 @@ pub fn updateDeclExports(self: *Coff, module: *Module, decl: *const Module.Decl,
             try module.failed_exports.ensureCapacity(module.gpa, module.failed_exports.items().len + 1);
             module.failed_exports.putAssumeCapacityNoClobber(
                 exp,
-                try Compilation.ErrorMsg.create(self.base.allocator, 0, "Unimplemented: Exports other than '_start'", .{}),
+                try Module.ErrorMsg.create(self.base.allocator, decl.srcLoc(), "Unimplemented: Exports other than '_start'", .{}),
             );
             continue;
         }
@@ -811,8 +815,11 @@ fn linkWithLLD(self: *Coff, comp: *Compilation) !void {
     // If there is no Zig code to compile, then we should skip flushing the output file because it
     // will not be part of the linker line anyway.
     const module_obj_path: ?[]const u8 = if (self.base.options.module) |module| blk: {
-        const use_stage1 = build_options.is_stage1 and self.base.options.use_llvm;
-        if (use_stage1) {
+        // Both stage1 and stage2 LLVM backend put the object file in the cache directory.
+        if (self.base.options.use_llvm) {
+            // Stage2 has to call flushModule since that outputs the LLVM object file.
+            if (!build_options.is_stage1) try self.flushModule(comp);
+
             const obj_basename = try std.zig.binNameAlloc(arena, .{
                 .root_name = self.base.options.root_name,
                 .target = self.base.options.target,
@@ -870,6 +877,11 @@ fn linkWithLLD(self: *Coff, comp: *Compilation) !void {
         man.hash.addStringSet(self.base.options.system_libs);
         man.hash.addOptional(self.base.options.subsystem);
         man.hash.add(self.base.options.is_test);
+        man.hash.add(self.base.options.tsaware);
+        man.hash.add(self.base.options.nxcompat);
+        man.hash.add(self.base.options.dynamicbase);
+        man.hash.addOptional(self.base.options.major_subsystem_version);
+        man.hash.addOptional(self.base.options.minor_subsystem_version);
 
         // We don't actually care whether it's a cache hit or miss; we just need the digest and the lock.
         _ = try man.hit();
@@ -880,7 +892,7 @@ fn linkWithLLD(self: *Coff, comp: *Compilation) !void {
             id_symlink_basename,
             &prev_digest_buf,
         ) catch |err| blk: {
-            log.debug("COFF LLD new_digest={} error: {}", .{ digest, @errorName(err) });
+            log.debug("COFF LLD new_digest={} error: {s}", .{ digest, @errorName(err) });
             // Handle this as a cache miss.
             break :blk prev_digest_buf[0..0];
         };
@@ -938,6 +950,13 @@ fn linkWithLLD(self: *Coff, comp: *Compilation) !void {
         if (!self.base.options.strip) {
             try argv.append("-DEBUG");
         }
+        if (self.base.options.lto) {
+            switch (self.base.options.optimize_mode) {
+                .Debug => {},
+                .ReleaseSmall => try argv.append("-OPT:lldlto=2"),
+                .ReleaseFast, .ReleaseSafe => try argv.append("-OPT:lldlto=3"),
+            }
+        }
         if (self.base.options.output_mode == .Exe) {
             const stack_size = self.base.options.stack_size_override orelse 16777216;
             try argv.append(try allocPrint(arena, "-STACK:{d}", .{stack_size}));
@@ -961,6 +980,26 @@ fn linkWithLLD(self: *Coff, comp: *Compilation) !void {
         if (is_dyn_lib) {
             try argv.append("-DLL");
         }
+
+        if (self.base.options.tsaware) {
+            try argv.append("-tsaware");
+        }
+        if (self.base.options.nxcompat) {
+            try argv.append("-nxcompat");
+        }
+        if (self.base.options.dynamicbase) {
+            try argv.append("-dynamicbase");
+        }
+        const subsystem_suffix = ss: {
+            if (self.base.options.major_subsystem_version) |major| {
+                if (self.base.options.minor_subsystem_version) |minor| {
+                    break :ss try allocPrint(arena, ",{d}.{d}", .{ major, minor });
+                } else {
+                    break :ss try allocPrint(arena, ",{d}", .{major});
+                }
+            }
+            break :ss "";
+        };
 
         try argv.append(try allocPrint(arena, "-OUT:{s}", .{full_out_path}));
 
@@ -1015,35 +1054,51 @@ fn linkWithLLD(self: *Coff, comp: *Compilation) !void {
         const mode: Mode = mode: {
             if (resolved_subsystem) |subsystem| switch (subsystem) {
                 .Console => {
-                    try argv.append("-SUBSYSTEM:console");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:console{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .win32;
                 },
                 .EfiApplication => {
-                    try argv.append("-SUBSYSTEM:efi_application");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_application{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .uefi;
                 },
                 .EfiBootServiceDriver => {
-                    try argv.append("-SUBSYSTEM:efi_boot_service_driver");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_boot_service_driver{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .uefi;
                 },
                 .EfiRom => {
-                    try argv.append("-SUBSYSTEM:efi_rom");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_rom{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .uefi;
                 },
                 .EfiRuntimeDriver => {
-                    try argv.append("-SUBSYSTEM:efi_runtime_driver");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:efi_runtime_driver{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .uefi;
                 },
                 .Native => {
-                    try argv.append("-SUBSYSTEM:native");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:native{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .win32;
                 },
                 .Posix => {
-                    try argv.append("-SUBSYSTEM:posix");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:posix{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .win32;
                 },
                 .Windows => {
-                    try argv.append("-SUBSYSTEM:windows");
+                    try argv.append(try allocPrint(arena, "-SUBSYSTEM:windows{s}", .{
+                        subsystem_suffix,
+                    }));
                     break :mode .win32;
                 },
             } else if (target.os.tag == .uefi) {
@@ -1236,11 +1291,11 @@ fn linkWithLLD(self: *Coff, comp: *Compilation) !void {
         // Update the file with the digest. If it fails we can continue; it only
         // means that the next invocation will have an unnecessary cache miss.
         Cache.writeSmallFile(directory.handle, id_symlink_basename, &digest) catch |err| {
-            log.warn("failed to save linking hash digest file: {}", .{@errorName(err)});
+            log.warn("failed to save linking hash digest file: {s}", .{@errorName(err)});
         };
         // Again failure here only means an unnecessary cache miss.
         man.writeManifest() catch |err| {
-            log.warn("failed to write cache manifest when linking: {}", .{@errorName(err)});
+            log.warn("failed to write cache manifest when linking: {s}", .{@errorName(err)});
         };
         // We hang on to this lock so that the output file path can be used without
         // other processes clobbering it.

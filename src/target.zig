@@ -1,5 +1,5 @@
 const std = @import("std");
-const llvm = @import("llvm_bindings.zig");
+const llvm = @import("codegen/llvm/bindings.zig");
 
 pub const ArchOsAbi = struct {
     arch: std.Target.Cpu.Arch,
@@ -189,7 +189,7 @@ pub fn supportsStackProbing(target: std.Target) bool {
 
 pub fn osToLLVM(os_tag: std.Target.Os.Tag) llvm.OSType {
     return switch (os_tag) {
-        .freestanding, .other => .UnknownOS,
+        .freestanding, .other, .opencl, .glsl450, .vulkan => .UnknownOS,
         .windows, .uefi => .Win32,
         .ananas => .Ananas,
         .cloudabi => .CloudABI,
@@ -280,7 +280,7 @@ pub fn archToLLVM(arch_tag: std.Target.Cpu.Arch) llvm.ArchType {
         .renderscript32 => .renderscript32,
         .renderscript64 => .renderscript64,
         .ve => .ve,
-        .spu_2 => .UnknownArch,
+        .spu_2, .spirv32, .spirv64 => .UnknownArch,
     };
 }
 
@@ -348,4 +348,20 @@ pub fn defaultCompilerRtOptimizeMode(target: std.Target) std.builtin.Mode {
     } else {
         return .ReleaseFast;
     }
+}
+
+pub fn hasRedZone(target: std.Target) bool {
+    return switch (target.cpu.arch) {
+        .x86_64,
+        .i386,
+        .powerpc,
+        .powerpc64,
+        .powerpc64le,
+        .aarch64,
+        .aarch64_be,
+        .aarch64_32,
+        => true,
+
+        else => false,
+    };
 }

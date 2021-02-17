@@ -381,7 +381,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
 
     const term = child.wait() catch |err| {
         // TODO surface a proper error here
-        log.err("unable to spawn {}: {}", .{ args[0], @errorName(err) });
+        log.err("unable to spawn {s}: {s}", .{ args[0], @errorName(err) });
         return error.ClangPreprocessorFailed;
     };
 
@@ -395,7 +395,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
         },
         else => {
             // TODO surface a proper error here
-            log.err("clang terminated unexpectedly with stderr: {}", .{stderr});
+            log.err("clang terminated unexpectedly with stderr: {s}", .{stderr});
             return error.ClangPreprocessorFailed;
         },
     }
@@ -405,7 +405,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
     });
     errdefer comp.gpa.free(lib_final_path);
 
-    const llvm = @import("llvm_bindings.zig");
+    const llvm = @import("codegen/llvm/bindings.zig");
     const arch_type = @import("target.zig").archToLLVM(target.cpu.arch);
     const def_final_path_z = try arena.dupeZ(u8, def_final_path);
     const lib_final_path_z = try arena.dupeZ(u8, lib_final_path);
@@ -707,6 +707,7 @@ const mingwex_generic_src = [_][]const u8{
     "math" ++ path.sep_str ++ "fpclassifyf.c",
     "math" ++ path.sep_str ++ "fpclassifyl.c",
     "math" ++ path.sep_str ++ "frexpf.c",
+    "math" ++ path.sep_str ++ "frexpl.c",
     "math" ++ path.sep_str ++ "hypot.c",
     "math" ++ path.sep_str ++ "hypotf.c",
     "math" ++ path.sep_str ++ "hypotl.c",

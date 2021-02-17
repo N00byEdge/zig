@@ -13,7 +13,9 @@ const glibc_multi_install_dir: ?[]const u8 = build_options.glibc_multi_install_d
 const ThreadPool = @import("ThreadPool.zig");
 const CrossTarget = std.zig.CrossTarget;
 
-const c_header = @embedFile("link/cbe.h");
+const zig_h = link.File.C.zig_h;
+
+const hr = "=" ** 40;
 
 test "self-hosted" {
     var ctx = TestContext.init();
@@ -29,23 +31,32 @@ const ErrorMsg = union(enum) {
         msg: []const u8,
         line: u32,
         column: u32,
+        kind: Kind,
     },
     plain: struct {
         msg: []const u8,
+        kind: Kind,
     },
 
-    fn init(other: Compilation.AllErrors.Message) ErrorMsg {
+    const Kind = enum {
+        @"error",
+        note,
+    };
+
+    fn init(other: Compilation.AllErrors.Message, kind: Kind) ErrorMsg {
         switch (other) {
             .src => |src| return .{
                 .src = .{
                     .msg = src.msg,
                     .line = @intCast(u32, src.line),
                     .column = @intCast(u32, src.column),
+                    .kind = kind,
                 },
             },
             .plain => |plain| return .{
                 .plain = .{
                     .msg = plain.msg,
+                    .kind = kind,
                 },
             },
         }
@@ -59,14 +70,15 @@ const ErrorMsg = union(enum) {
     ) !void {
         switch (self) {
             .src => |src| {
-                return writer.print(":{d}:{d}: error: {s}", .{
+                return writer.print(":{d}:{d}: {s}: {s}", .{
                     src.line + 1,
                     src.column + 1,
+                    @tagName(src.kind),
                     src.msg,
                 });
             },
             .plain => |plain| {
-                return writer.print("error: {s}", .{plain.msg});
+                return writer.print("{s}: {s}", .{ plain.msg, @tagName(plain.kind) });
             },
         }
     }
@@ -86,9 +98,6 @@ pub const TestContext = struct {
         /// effects of the incremental compilation.
         src: [:0]const u8,
         case: union(enum) {
-            /// A transformation update transforms the input and tests against
-            /// the expected output ZIR.
-            Transformation: [:0]const u8,
             /// Check the main binary output file against an expected set of bytes.
             /// This is most useful with, for example, `-ofmt=c`.
             CompareObjectFile: []const u8,
@@ -135,17 +144,9 @@ pub const TestContext = struct {
         extension: Extension,
         object_format: ?std.builtin.ObjectFormat = null,
         emit_h: bool = false,
+        llvm_backend: bool = false,
 
         files: std.ArrayList(File),
-
-        /// Adds a subcase in which the module is updated with `src`, and the
-        /// resulting ZIR is validated against `result`.
-        pub fn addTransform(self: *Case, src: [:0]const u8, result: [:0]const u8) void {
-            self.updates.append(.{
-                .src = src,
-                .case = .{ .Transformation = result },
-            }) catch unreachable;
-        }
 
         /// Adds a subcase in which the module is updated with `src`, and a C
         /// header is generated.
@@ -181,31 +182,37 @@ pub const TestContext = struct {
         /// the form `:line:column: error: message`.
         pub fn addError(self: *Case, src: [:0]const u8, errors: []const []const u8) void {
             var array = self.updates.allocator.alloc(ErrorMsg, errors.len) catch unreachable;
-            for (errors) |e, i| {
-                if (e[0] != ':') {
-                    array[i] = .{ .plain = .{ .msg = e } };
+            for (errors) |err_msg_line, i| {
+                if (std.mem.startsWith(u8, err_msg_line, "error: ")) {
+                    array[i] = .{
+                        .plain = .{ .msg = err_msg_line["error: ".len..], .kind = .@"error" },
+                    };
+                    continue;
+                } else if (std.mem.startsWith(u8, err_msg_line, "note: ")) {
+                    array[i] = .{
+                        .plain = .{ .msg = err_msg_line["note: ".len..], .kind = .note },
+                    };
                     continue;
                 }
-                var cur = e[1..];
-                var line_index = std.mem.indexOf(u8, cur, ":");
-                if (line_index == null) {
-                    @panic("Invalid test: error must be specified as follows:\n:line:column: error: message\n=========\n");
-                }
-                const line = std.fmt.parseInt(u32, cur[0..line_index.?], 10) catch @panic("Unable to parse line number");
-                cur = cur[line_index.? + 1 ..];
-                const column_index = std.mem.indexOf(u8, cur, ":");
-                if (column_index == null) {
-                    @panic("Invalid test: error must be specified as follows:\n:line:column: error: message\n=========\n");
-                }
-                const column = std.fmt.parseInt(u32, cur[0..column_index.?], 10) catch @panic("Unable to parse column number");
-                cur = cur[column_index.? + 2 ..];
-                if (!std.mem.eql(u8, cur[0..7], "error: ")) {
-                    @panic("Invalid test: error must be specified as follows:\n:line:column: error: message\n=========\n");
-                }
-                const msg = cur[7..];
+                // example: ":1:2: error: bad thing happened"
+                var it = std.mem.split(err_msg_line, ":");
+                _ = it.next() orelse @panic("missing colon");
+                const line_text = it.next() orelse @panic("missing line");
+                const col_text = it.next() orelse @panic("missing column");
+                const kind_text = it.next() orelse @panic("missing 'error'/'note'");
+                const msg = it.rest()[1..]; // skip over the space at end of "error: "
+
+                const line = std.fmt.parseInt(u32, line_text, 10) catch @panic("bad line number");
+                const column = std.fmt.parseInt(u32, col_text, 10) catch @panic("bad column number");
+                const kind: ErrorMsg.Kind = if (std.mem.eql(u8, kind_text, " error"))
+                    .@"error"
+                else if (std.mem.eql(u8, kind_text, " note"))
+                    .note
+                else
+                    @panic("expected 'error'/'note'");
 
                 if (line == 0 or column == 0) {
-                    @panic("Invalid test: error line and column must be specified starting at one!");
+                    @panic("line and column must be specified starting at one");
                 }
 
                 array[i] = .{
@@ -213,6 +220,7 @@ pub const TestContext = struct {
                         .msg = msg,
                         .line = line - 1,
                         .column = column - 1,
+                        .kind = kind,
                     },
                 };
             }
@@ -266,6 +274,21 @@ pub const TestContext = struct {
         return &ctx.cases.items[ctx.cases.items.len - 1];
     }
 
+    /// Adds a test case that uses the LLVM backend to emit an executable.
+    /// Currently this implies linking libc, because only then we can generate a testable executable.
+    pub fn exeUsingLlvmBackend(ctx: *TestContext, name: []const u8, target: CrossTarget) *Case {
+        ctx.cases.append(Case{
+            .name = name,
+            .target = target,
+            .updates = std.ArrayList(Update).init(ctx.cases.allocator),
+            .output_mode = .Exe,
+            .extension = .Zig,
+            .files = std.ArrayList(File).init(ctx.cases.allocator),
+            .llvm_backend = true,
+        }) catch unreachable;
+        return &ctx.cases.items[ctx.cases.items.len - 1];
+    }
+
     pub fn addObj(
         ctx: *TestContext,
         name: []const u8,
@@ -308,11 +331,11 @@ pub const TestContext = struct {
     }
 
     pub fn c(ctx: *TestContext, name: []const u8, target: CrossTarget, src: [:0]const u8, comptime out: [:0]const u8) void {
-        ctx.addC(name, target, .Zig).addCompareObjectFile(src, c_header ++ out);
+        ctx.addC(name, target, .Zig).addCompareObjectFile(src, zig_h ++ out);
     }
 
     pub fn h(ctx: *TestContext, name: []const u8, target: CrossTarget, src: [:0]const u8, comptime out: [:0]const u8) void {
-        ctx.addC(name, target, .Zig).addHeader(src, c_header ++ out);
+        ctx.addC(name, target, .Zig).addHeader(src, zig_h ++ out);
     }
 
     pub fn addCompareOutput(
@@ -518,8 +541,28 @@ pub const TestContext = struct {
         try thread_pool.init(std.testing.allocator);
         defer thread_pool.deinit();
 
+        // Use the same global cache dir for all the tests, such that we for example don't have to
+        // rebuild musl libc for every case (when LLVM backend is enabled).
+        var global_tmp = std.testing.tmpDir(.{});
+        defer global_tmp.cleanup();
+
+        var cache_dir = try global_tmp.dir.makeOpenPath("zig-cache", .{});
+        defer cache_dir.close();
+        const tmp_dir_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".", "zig-cache", "tmp", &global_tmp.sub_path });
+        defer std.testing.allocator.free(tmp_dir_path);
+
+        const global_cache_directory: Compilation.Directory = .{
+            .handle = cache_dir,
+            .path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ tmp_dir_path, "zig-cache" }),
+        };
+        defer std.testing.allocator.free(global_cache_directory.path.?);
+
         for (self.cases.items) |case| {
             if (build_options.skip_non_native and case.target.getCpuArch() != std.Target.current.cpu.arch)
+                continue;
+
+            // Skip tests that require LLVM backend when it is not available
+            if (!build_options.have_llvm and case.llvm_backend)
                 continue;
 
             var prg_node = root_node.start(case.name, case.updates.items.len);
@@ -537,6 +580,7 @@ pub const TestContext = struct {
                 case,
                 zig_lib_directory,
                 &thread_pool,
+                global_cache_directory,
             );
         }
     }
@@ -548,6 +592,7 @@ pub const TestContext = struct {
         case: Case,
         zig_lib_directory: Compilation.Directory,
         thread_pool: *ThreadPool,
+        global_cache_directory: Compilation.Directory,
     ) !void {
         const target_info = try std.zig.system.NativeTargetInfo.detect(allocator, case.target);
         const target = target_info.target;
@@ -601,7 +646,7 @@ pub const TestContext = struct {
             null;
         const comp = try Compilation.create(allocator, .{
             .local_cache_directory = zig_cache_directory,
-            .global_cache_directory = zig_cache_directory,
+            .global_cache_directory = global_cache_directory,
             .zig_lib_directory = zig_lib_directory,
             .thread_pool = thread_pool,
             .root_name = "test_case",
@@ -619,6 +664,11 @@ pub const TestContext = struct {
             .object_format = case.object_format,
             .is_native_os = case.target.isNativeOs(),
             .is_native_abi = case.target.isNativeAbi(),
+            .dynamic_linker = target_info.dynamic_linker.get(),
+            .link_libc = case.llvm_backend,
+            .use_llvm = case.llvm_backend,
+            .use_lld = case.llvm_backend,
+            .self_exe_path = std.testing.zig_exe_path,
         });
         defer comp.destroy();
 
@@ -646,24 +696,23 @@ pub const TestContext = struct {
                 var all_errors = try comp.getAllErrorsAlloc();
                 defer all_errors.deinit(allocator);
                 if (all_errors.list.len != 0) {
-                    std.debug.print("\nErrors occurred updating the compilation:\n================\n", .{});
+                    std.debug.print(
+                        "\nCase '{s}': unexpected errors at update_index={d}:\n{s}\n",
+                        .{ case.name, update_index, hr },
+                    );
                     for (all_errors.list) |err_msg| {
                         switch (err_msg) {
                             .src => |src| {
-                                std.debug.print(":{d}:{d}: error: {s}\n================\n", .{
-                                    src.line + 1, src.column + 1, src.msg,
+                                std.debug.print(":{d}:{d}: error: {s}\n{s}\n", .{
+                                    src.line + 1, src.column + 1, src.msg, hr,
                                 });
                             },
                             .plain => |plain| {
-                                std.debug.print("error: {s}\n================\n", .{plain.msg});
+                                std.debug.print("error: {s}\n{s}\n", .{ plain.msg, hr });
                             },
                         }
                     }
-                    if (comp.bin_file.cast(link.File.C)) |c_file| {
-                        std.debug.print("Generated C: \n===============\n{}\n\n===========\n\n", .{
-                            c_file.main.items,
-                        });
-                    }
+                    // TODO print generated C code
                     std.debug.print("Test failed.\n", .{});
                     std.process.exit(1);
                 }
@@ -684,48 +733,36 @@ pub const TestContext = struct {
 
                     std.testing.expectEqualStrings(expected_output, out);
                 },
-                .Transformation => |expected_output| {
-                    update_node.setEstimatedTotalItems(5);
-                    var emit_node = update_node.start("emit", 0);
-                    emit_node.activate();
-                    var new_zir_module = try zir.emit(allocator, comp.bin_file.options.module.?);
-                    defer new_zir_module.deinit(allocator);
-                    emit_node.end();
-
-                    var write_node = update_node.start("write", 0);
-                    write_node.activate();
-                    var out_zir = std.ArrayList(u8).init(allocator);
-                    defer out_zir.deinit();
-                    try new_zir_module.writeToStream(allocator, out_zir.outStream());
-                    write_node.end();
-
+                .Error => |case_error_list| {
                     var test_node = update_node.start("assert", 0);
                     test_node.activate();
                     defer test_node.end();
 
-                    std.testing.expectEqualStrings(expected_output, out_zir.items);
-                },
-                .Error => |e| {
-                    var test_node = update_node.start("assert", 0);
-                    test_node.activate();
-                    defer test_node.end();
-                    var handled_errors = try arena.alloc(bool, e.len);
-                    for (handled_errors) |*handled| {
-                        handled.* = false;
-                    }
-                    var all_errors = try comp.getAllErrorsAlloc();
-                    defer all_errors.deinit(allocator);
-                    for (all_errors.list) |a| {
-                        for (e) |ex, i| {
-                            const a_tag: @TagType(@TypeOf(a)) = a;
-                            const ex_tag: @TagType(@TypeOf(ex)) = ex;
-                            switch (a) {
-                                .src => |src| {
+                    const handled_errors = try arena.alloc(bool, case_error_list.len);
+                    std.mem.set(bool, handled_errors, false);
+
+                    var actual_errors = try comp.getAllErrorsAlloc();
+                    defer actual_errors.deinit(allocator);
+
+                    var any_failed = false;
+                    var notes_to_check = std.ArrayList(*const Compilation.AllErrors.Message).init(allocator);
+                    defer notes_to_check.deinit();
+
+                    for (actual_errors.list) |actual_error| {
+                        for (case_error_list) |case_msg, i| {
+                            const ex_tag: std.meta.Tag(@TypeOf(case_msg)) = case_msg;
+                            switch (actual_error) {
+                                .src => |actual_msg| {
+                                    for (actual_msg.notes) |*note| {
+                                        try notes_to_check.append(note);
+                                    }
+
                                     if (ex_tag != .src) continue;
 
-                                    if (src.line == ex.src.line and
-                                        src.column == ex.src.column and
-                                        std.mem.eql(u8, ex.src.msg, src.msg))
+                                    if (actual_msg.line == case_msg.src.line and
+                                        actual_msg.column == case_msg.src.column and
+                                        std.mem.eql(u8, case_msg.src.msg, actual_msg.msg) and
+                                        case_msg.src.kind == .@"error")
                                     {
                                         handled_errors[i] = true;
                                         break;
@@ -734,7 +771,9 @@ pub const TestContext = struct {
                                 .plain => |plain| {
                                     if (ex_tag != .plain) continue;
 
-                                    if (std.mem.eql(u8, ex.plain.msg, plain.msg)) {
+                                    if (std.mem.eql(u8, case_msg.plain.msg, plain.msg) and
+                                        case_msg.plain.kind == .@"error")
+                                    {
                                         handled_errors[i] = true;
                                         break;
                                     }
@@ -742,22 +781,66 @@ pub const TestContext = struct {
                             }
                         } else {
                             std.debug.print(
-                                "{s}\nUnexpected error:\n================\n{}\n================\nTest failed.\n",
-                                .{ case.name, ErrorMsg.init(a) },
+                                "\nUnexpected error:\n{s}\n{}\n{s}",
+                                .{ hr, ErrorMsg.init(actual_error, .@"error"), hr },
                             );
-                            std.process.exit(1);
+                            any_failed = true;
+                        }
+                    }
+                    while (notes_to_check.popOrNull()) |note| {
+                        for (case_error_list) |case_msg, i| {
+                            const ex_tag: std.meta.Tag(@TypeOf(case_msg)) = case_msg;
+                            switch (note.*) {
+                                .src => |actual_msg| {
+                                    for (actual_msg.notes) |*sub_note| {
+                                        try notes_to_check.append(sub_note);
+                                    }
+                                    if (ex_tag != .src) continue;
+
+                                    if (actual_msg.line == case_msg.src.line and
+                                        actual_msg.column == case_msg.src.column and
+                                        std.mem.eql(u8, case_msg.src.msg, actual_msg.msg) and
+                                        case_msg.src.kind == .note)
+                                    {
+                                        handled_errors[i] = true;
+                                        break;
+                                    }
+                                },
+                                .plain => |plain| {
+                                    if (ex_tag != .plain) continue;
+
+                                    if (std.mem.eql(u8, case_msg.plain.msg, plain.msg) and
+                                        case_msg.plain.kind == .note)
+                                    {
+                                        handled_errors[i] = true;
+                                        break;
+                                    }
+                                },
+                            }
+                        } else {
+                            std.debug.print(
+                                "\nUnexpected note:\n{s}\n{}\n{s}",
+                                .{ hr, ErrorMsg.init(note.*, .note), hr },
+                            );
+                            any_failed = true;
                         }
                     }
 
                     for (handled_errors) |handled, i| {
                         if (!handled) {
-                            const er = e[i];
                             std.debug.print(
-                                "{s}\nDid not receive error:\n================\n{}\n================\nTest failed.\n",
-                                .{ case.name, er },
+                                "\nExpected error not found:\n{s}\n{}\n{s}",
+                                .{ hr, case_error_list[i], hr },
                             );
-                            std.process.exit(1);
+                            any_failed = true;
                         }
+                    }
+
+                    if (any_failed) {
+                        std.debug.print("\nTest case '{s}' failed, update_index={d}.\n", .{
+                            case.name, update_index,
+                        });
+                        std.process.exit(1);
                     }
                 },
                 .Execution => |expected_stdout| {
@@ -775,6 +858,10 @@ pub const TestContext = struct {
                         // child process.
                         const exe_path = try std.fmt.allocPrint(arena, "." ++ std.fs.path.sep_str ++ "{s}", .{bin_name});
                         if (case.object_format != null and case.object_format.? == .c) {
+                            if (case.target.getExternalExecutor() != .native) {
+                                // We wouldn't be able to run the compiled C code.
+                                return; // Pass test.
+                            }
                             try argv.appendSlice(&[_][]const u8{
                                 std.testing.zig_exe_path,
                                 "run",
